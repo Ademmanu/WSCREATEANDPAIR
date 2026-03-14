@@ -33,10 +33,9 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const RUN_ID = process.env.GITHUB_RUN_ID;
 
-// WhatsApp APK — use a pinned version from APKMirror or supply your own URL
-const WA_APK_URL = 'https://d.apkpure.com/b/APK/com.whatsapp?versionCode=latest';
+// WhatsApp APK is downloaded by the workflow before the emulator boots.
+// See .github/workflows/register.yml — "Download WhatsApp APK" step.
 const WA_PACKAGE = 'com.whatsapp';
-const WA_ACTIVITY = 'com.whatsapp/.Main';
 
 const WAIT_MS = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -203,17 +202,19 @@ function parseWaitSeconds(text) {
 // ── Main registration flow ────────────────────────────────────────────────────
 
 async function installWhatsApp() {
-  console.log('[SETUP] Downloading WhatsApp APK...');
-  // Use a reliable mirror; supply your own APK path for production
-  execSync(
-    `wget -q -O /tmp/whatsapp.apk "${WA_APK_URL}" || ` +
-    // Fallback: use pre-uploaded APK from repo assets
-    `cp .github/assets/whatsapp.apk /tmp/whatsapp.apk`,
-    { timeout: 120000, stdio: 'inherit' }
-  );
-  console.log('[SETUP] Installing WhatsApp...');
+  // APK was already downloaded by the workflow step before the emulator booted.
+  // It lives at /tmp/whatsapp.apk — just install it directly.
+  const apkPath = '/tmp/whatsapp.apk';
+
+  const { existsSync, statSync } = require('fs');
+  if (!existsSync(apkPath)) {
+    throw new Error('WhatsApp APK not found at /tmp/whatsapp.apk — download step may have failed');
+  }
+
+  const size = statSync(apkPath).size;
+  console.log(`[SETUP] Installing WhatsApp APK (${(size / 1024 / 1024).toFixed(1)} MB)...`);
   adb('install -r /tmp/whatsapp.apk', 120000);
-  console.log('[SETUP] WhatsApp installed');
+  console.log('[SETUP] WhatsApp installed successfully');
 }
 
 async function launchWhatsApp() {
