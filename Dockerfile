@@ -2,8 +2,8 @@
 FROM node:20-slim AS node-deps
 
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
+COPY package.json ./
+RUN npm install --omit=dev
 
 # ── Stage 2: Final image ──────────────────────────────────────────────────────
 FROM python:3.12-slim
