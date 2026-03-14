@@ -1,1 +1,66 @@
+name: WhatsApp Registration
 
+on:
+  workflow_dispatch:
+    inputs:
+      phone_number:
+        description: 'Phone number to register'
+        required: true
+        type: string
+      telegram_user_id:
+        description: 'Telegram user ID for callbacks'
+        required: true
+        type: string
+      webhook_url:
+        description: 'Bot webhook base URL'
+        required: true
+        type: string
+      webhook_secret:
+        description: 'Shared secret for webhook auth'
+        required: true
+        type: string
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ADB + emulator tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            adb android-tools-adb curl jq wget unzip
+
+      - name: Set up Android SDK + emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          target: google_apis
+          arch: x86_64
+          profile: pixel_4
+          avd-name: wa_reg
+          emulator-options: >
+            -no-window
+            -gpu swiftshader_indirect
+            -no-snapshot
+            -noaudio
+            -no-boot-anim
+          disable-animations: true
+          script: node .github/scripts/wa_register.js
+
+        env:
+          PHONE_NUMBER: ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
+          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          NODE_PORT: '3001'
