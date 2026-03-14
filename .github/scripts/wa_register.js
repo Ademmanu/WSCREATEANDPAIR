@@ -234,27 +234,52 @@ async function installWhatsApp() {
 
   await WAIT_MS(3000);
 
+  // First check APK architecture to understand what we are installing
+  const libFolders = run('unzip -l /tmp/whatsapp.apk 2>/dev/null | grep "lib/" | awk '{print $4}' | cut -d/ -f1-2 | sort -u', 10000);
+  console.log(`[SETUP] APK native libs: ${libFolders || '(none found — may be pure Java APK)'}`);
+
   let installed = false;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       console.log(`[SETUP] Install attempt ${attempt}/3...`);
-      const result = run('adb install -r -t -g /tmp/whatsapp.apk', 300000);
+
+      // Capture both stdout and stderr from adb install
+      let result = '';
+      try {
+        result = run('adb install -r -t -g /tmp/whatsapp.apk 2>&1', 300000);
+      } catch (e) {
+        result = e.message || '';
+      }
       console.log(`[SETUP] Install output: ${result}`);
-      // "Performing Streamed Install" followed by "Success" on next line
-      // result.includes covers both same-line and multi-line output
+
       if (result.toLowerCase().includes('success')) {
         installed = true;
         break;
       }
-      // Also accept if no failure indicators present
-      if (!result.includes('FAILED') && !result.includes('Exception') &&
-          !result.includes('error') && result.length > 5) {
-        console.log('[SETUP] No explicit Success but no failure — assuming installed');
+
+      // Print specific failure reason if present
+      if (result.includes('INSTALL_FAILED')) {
+        console.error(`[SETUP] Install failed: ${result}`);
+        // INSTALL_FAILED_NO_MATCHING_ABIS means wrong architecture
+        if (result.includes('INSTALL_FAILED_NO_MATCHING_ABIS')) {
+          throw new Error('APK architecture does not match emulator — need x86 or armeabi-v7a APK');
+        }
+        break; // Don't retry on definitive install failures
+      }
+
+      // Verify package actually exists after install
+      await WAIT_MS(2000);
+      const pkgCheck = run('adb shell pm list packages 2>/dev/null', 10000);
+      if (pkgCheck.includes('com.whatsapp')) {
+        console.log('[SETUP] Package verified in pm list');
         installed = true;
         break;
       }
+
+      console.error(`[SETUP] Package not found after install attempt ${attempt}`);
     } catch (e) {
-      console.error(`[SETUP] Install attempt ${attempt} failed: ${e.message}`);
+      console.error(`[SETUP] Install attempt ${attempt} error: ${e.message}`);
+      if (e.message.includes('architecture')) throw e; // Don't retry arch errors
       if (attempt < 3) {
         await WAIT_MS(10000);
         run('adb kill-server', 10000);
@@ -264,7 +289,7 @@ async function installWhatsApp() {
       }
     }
   }
-  if (!installed) throw new Error('WhatsApp APK install failed after 3 attempts');
+  if (!installed) throw new Error('WhatsApp APK install failed after 3 attempts — check APK architecture matches emulator (need armeabi-v7a or x86)');
   console.log('[SETUP] WhatsApp installed successfully');
   await WAIT_MS(2000);
 }
@@ -319,10 +344,11 @@ async function main() {
     await WAIT_MS(1000);
 
     // Verify WhatsApp is actually installed before launching
-    const pkgCheck = run('adb shell pm list packages | grep whatsapp', 5000);
-    console.log(`[MAIN] WhatsApp package check: ${pkgCheck}`);
-    if (!pkgCheck.includes('com.whatsapp')) {
-      throw new Error('WhatsApp package not found after install — installation may have failed silently');
+    const allPkgs = run('adb shell pm list packages 2>/dev/null', 10000);
+    const pkgFound = allPkgs.includes('com.whatsapp');
+    console.log(`[MAIN] WhatsApp installed: ${pkgFound}`);
+    if (!pkgFound) {
+      throw new Error('WhatsApp package not found — installation failed silently');
     }
 
     // Launch WhatsApp
