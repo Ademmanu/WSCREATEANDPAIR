@@ -2,12 +2,15 @@
 FROM node:20-slim AS node-deps
 
 WORKDIR /app
+
+# Skip Puppeteer's Chromium download — we use system Chromium in stage 2
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
 COPY package.json ./
 RUN npm install --omit=dev
 
 # ── Stage 2: Final image ──────────────────────────────────────────────────────
-# Use node:20-slim as base so Node.js is already present and correct.
-# We then add Python on top of it.
 FROM node:20-slim
 
 # Install Python 3 + pip + all Chromium/Puppeteer system deps
@@ -45,11 +48,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Tell Puppeteer to use the system Chromium — skip its own download
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+# Skip Puppeteer Chromium download and point to system Chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Make python3 available as "python" and pip3 as "pip"
+# Make python3/pip3 available as python/pip
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python \
  && ln -sf /usr/bin/pip3 /usr/local/bin/pip
 
@@ -63,14 +66,14 @@ COPY package.json ./
 COPY session_manager.js ./
 COPY .github/ ./.github/
 
-# Install Python deps (use --break-system-packages for Debian bookworm)
+# Install Python deps
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy Python source
 COPY bot.py db.py github_actions.py utils.py otp_store.py ./
 
-# Expose port (Render sets $PORT)
+# Expose port
 EXPOSE 8080
 
 # Start both services
