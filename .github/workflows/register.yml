@@ -97,22 +97,30 @@ jobs:
           NODE_PORT: '3001'
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 33
-          target: google_apis
+          # API 29 boots in ~90s on GitHub runners vs 5-8min for API 33.
+          # WhatsApp supports Android 5.0+ so API 29 works fine.
+          # 'default' target has no Google Play overhead — boots faster.
+          api-level: 29
+          target: default
           arch: x86_64
           profile: pixel_4
           avd-name: wa_reg
+          # 'swiftshader' (not swiftshader_indirect) is faster on CI runners.
+          # -no-snapshot disables snapshot save/load which hangs on cold runners.
+          # -memory 2048 gives the emulator enough RAM to run WhatsApp.
           emulator-options: >
             -no-window
-            -gpu swiftshader_indirect
+            -gpu swiftshader
             -no-snapshot
             -noaudio
             -no-boot-anim
+            -memory 2048
+            -cores 2
           disable-animations: true
+          # Wait up to 600s (10 min) for boot before failing
+          emulator-boot-timeout: 600
           script: node .github/scripts/wa_register.js
 
-      # ── Fires only when the registration step fails (script crash, emulator
-      #    error, APK install failure, etc.) ──────────────────────────────────
       - name: Notify bot — registration failed
         if: failure()
         env:
@@ -134,7 +142,6 @@ jobs:
               \"reason\": \"GitHub Actions workflow failed — emulator or script error\"
             }"
 
-      # ── Fires only when the job is cancelled (manual cancel or timeout) ────
       - name: Notify bot — registration cancelled
         if: cancelled()
         env:
