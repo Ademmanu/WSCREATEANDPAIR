@@ -281,6 +281,27 @@ async function main() {
     }
     console.log('[MAIN] Emulator is ready');
 
+    // ── Unlock the screen ─────────────────────────────────────────────────
+    // The emulator boots to a lock screen. Must unlock before launching apps.
+    console.log('[MAIN] Unlocking screen...');
+    run('adb shell input keyevent KEYCODE_WAKEUP', 5000);       // Wake screen
+    await WAIT_MS(1000);
+    run('adb shell input keyevent KEYCODE_MENU', 5000);          // Trigger unlock
+    await WAIT_MS(500);
+    run('adb shell input swipe 540 1800 540 200 300', 5000);     // Swipe up to unlock
+    await WAIT_MS(1000);
+    run('adb shell input keyevent KEYCODE_HOME', 5000);          // Go to home screen
+    await WAIT_MS(2000);
+
+    // Disable lock screen permanently for this session
+    run('adb shell settings put secure lockscreen.disabled 1', 5000);
+    run('adb shell settings put global stay_on_while_plugged_in 3', 5000);
+
+    // Confirm we are on home screen
+    const unlockCheck = await dumpUI(5000);
+    console.log('[MAIN] Screen after unlock:');
+    await getCurrentScreen();
+
     await installWhatsApp();
 
     // ── Launch WhatsApp ───────────────────────────────────────────────────
