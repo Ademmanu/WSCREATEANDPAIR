@@ -285,21 +285,63 @@ async function main() {
 
     // ── Launch WhatsApp ───────────────────────────────────────────────────
     console.log('[MAIN] Launching WhatsApp...');
-    run(`adb shell monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1`, 15000);
-    await WAIT_MS(6000); // Wait for WhatsApp to render first screen
 
-    // Log what's on screen
+    // Use am start with explicit activity — more reliable than monkey
+    // Try the main entry points used across WhatsApp versions
+    const launchCmds = [
+      `adb shell am start -n com.whatsapp/com.whatsapp.Main`,
+      `adb shell am start -n com.whatsapp/com.whatsapp.registration.VerifyPhoneNumber`,
+      `adb shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.whatsapp/.Main`,
+      `adb shell monkey -p com.whatsapp -c android.intent.category.LAUNCHER 1`,
+    ];
+
+    for (const cmd of launchCmds) {
+      console.log(`[MAIN] Trying launch: ${cmd}`);
+      const result = run(cmd, 10000);
+      console.log(`[MAIN] Launch result: ${result}`);
+      if (!result.includes('Error') && !result.includes('does not exist')) break;
+      await WAIT_MS(1000);
+    }
+
+    // Wait for WhatsApp to render — give it up to 30s to show anything
+    console.log('[MAIN] Waiting for WhatsApp to render...');
+    let waVisible = false;
+    for (let i = 0; i < 15; i++) {
+      await WAIT_MS(2000);
+      const xml = await dumpUI(5000);
+      // WhatsApp is visible if screen no longer shows home screen apps
+      if (xml && !xml.includes('WebView Browser Tester') && xml.length > 500) {
+        console.log('[MAIN] WhatsApp is rendering');
+        waVisible = true;
+        break;
+      }
+      // If still on home screen, try tapping the WhatsApp icon directly
+      if (i === 5) {
+        console.log('[MAIN] Still on home screen — retrying launch via am start');
+        run(`adb shell am start -n com.whatsapp/com.whatsapp.Main`, 10000);
+      }
+      await getCurrentScreen();
+    }
+
+    if (!waVisible) {
+      // Last resort: force-stop and restart
+      console.log('[MAIN] WhatsApp not visible — force stopping and restarting');
+      run(`adb shell am force-stop ${WA_PACKAGE}`, 5000);
+      await WAIT_MS(2000);
+      run(`adb shell am start -n com.whatsapp/com.whatsapp.Main`, 10000);
+      await WAIT_MS(8000);
+    }
+
     await getCurrentScreen();
 
     // ── Agree & Continue (first launch) ──────────────────────────────────
     // WhatsApp shows "AGREE AND CONTINUE" on very first launch
-    // Try multiple text variants used in different WhatsApp versions
-    for (const agreeText of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept']) {
+    for (const agreeText of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE AND CONTINUE', 'AGREE', 'Accept', 'I agree']) {
       const xml = await dumpUI(3000);
-      if (xml && xml.includes(agreeText)) {
+      if (xml && xml.toLowerCase().includes(agreeText.toLowerCase())) {
         console.log(`[MAIN] Found agree button: "${agreeText}"`);
-        await tapText(agreeText, 5000);
-        await WAIT_MS(3000);
+        await tapText(agreeText, 8000);
+        await WAIT_MS(4000);
         break;
       }
     }
@@ -307,16 +349,34 @@ async function main() {
     await getCurrentScreen();
 
     // ── Phone number entry ────────────────────────────────────────────────
-    // WhatsApp 2023+ shows "Enter your phone number" or "Your phone number"
+    // Wait up to 60s total for any variant of the phone number screen
     let phoneScreenXml = null;
-    for (const screenText of [
+    const phoneScreenTexts = [
       'Enter your phone number',
       'Your phone number',
       'phone number',
       'enter your phone',
-    ]) {
-      phoneScreenXml = await waitForText(screenText, 20000);
-      if (phoneScreenXml) break;
+      'Enter phone',
+      'Phone number',
+      'country code',
+      'Country code',
+    ];
+
+    console.log('[MAIN] Waiting for phone number entry screen...');
+    const phoneDeadline = Date.now() + 60000;
+    while (Date.now() < phoneDeadline && !phoneScreenXml) {
+      const xml = await dumpUI(5000);
+      for (const t of phoneScreenTexts) {
+        if (xml && xml.toLowerCase().includes(t.toLowerCase())) {
+          console.log(`[MAIN] Phone screen found via: "${t}"`);
+          phoneScreenXml = xml;
+          break;
+        }
+      }
+      if (!phoneScreenXml) {
+        await getCurrentScreen();
+        await WAIT_MS(3000);
+      }
     }
 
     if (!phoneScreenXml) {
