@@ -332,6 +332,32 @@ async function main() {
       await WAIT_MS(8000);
     }
 
+    // ── Dismiss crash dialog if WhatsApp keeps stopping ───────────────────
+    // This happens when the APK architecture doesn't match the emulator.
+    // "google_apis" target includes ARM translation so this should not appear,
+    // but handle it defensively just in case.
+    const crashXml = await dumpUI(3000);
+    if (crashXml && crashXml.includes('keeps stopping')) {
+      console.error('[MAIN] WhatsApp crash detected — "keeps stopping" dialog');
+      console.error('[MAIN] This usually means ARM/x86 architecture mismatch');
+      // Try closing and relaunching once
+      run('adb shell input keyevent KEYCODE_BACK', 3000);
+      await WAIT_MS(1000);
+      for (const btn of ['Close app', 'OK', 'Close']) {
+        if (crashXml.includes(btn)) {
+          await tapText(btn, 5000);
+          break;
+        }
+      }
+      await WAIT_MS(3000);
+      // Check if still crashing
+      const stillCrash = await dumpUI(3000);
+      if (stillCrash && stillCrash.includes('keeps stopping')) {
+        await sendWebhook('bad_number', { reason: 'WhatsApp crashes on launch — architecture mismatch or corrupted APK' });
+        process.exit(0);
+      }
+    }
+
     await getCurrentScreen();
 
     // ── Agree & Continue (first launch) ──────────────────────────────────
