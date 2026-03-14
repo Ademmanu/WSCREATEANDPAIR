@@ -41,7 +41,12 @@ jobs:
             adb android-tools-adb curl jq wget unzip
 
       - name: Install Node dependencies
-        run: npm ci
+        # npm ci requires a lockfile — use npm install instead.
+        # PUPPETEER_SKIP_CHROMIUM_DOWNLOAD stops Puppeteer downloading
+        # its own Chromium on the runner (we use ADB/emulator, not Puppeteer here).
+        env:
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
+        run: npm install --omit=dev
 
       - name: Download WhatsApp APK
         run: |
@@ -112,4 +117,5 @@ jobs:
           WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
           WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
           NODE_PORT: '3001'
