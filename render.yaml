@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: wa-telegram-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: NODE_PORT
+        value: "3001"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: GITHUB_ACCOUNTS_JSON
+        sync: false
+      - key: GITHUB_REPO
+        sync: false
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium
+      - key: PUPPETEER_SKIP_CHROMIUM_DOWNLOAD
+        value: "true"
