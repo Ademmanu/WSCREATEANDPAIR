@@ -34,12 +34,6 @@ jobs:
         with:
           node-version: '20'
 
-      # ── KVM access — must be first, before emulator starts ─────────────────
-      # GitHub ubuntu-latest runners have KVM available but /dev/kvm is not
-      # accessible to the current user without this udev rule.
-      # Without KVM the emulator falls back to TCG software CPU emulation —
-      # Android boot stalls, ADB stays "offline" for minutes, sometimes forever.
-      # This single step cuts boot time from 8+ minutes down to ~90 seconds.
       - name: Enable KVM access
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -59,45 +53,48 @@ jobs:
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
         run: npm install --omit=dev
 
-      - name: Download WhatsApp APK
+      - name: Download WhatsApp x86 APK
         run: |
-          echo "[APK] Downloading latest WhatsApp APK..."
+          echo "[APK] Downloading WhatsApp x86 APK for emulator..."
 
+          # WhatsApp publishes a universal APK and separate arch-specific ones.
+          # For x86_64 emulators we need the x86 or x86_64 variant.
+          # APKPure serves the universal ARM APK by default — we must request x86.
+
+          # Try APKPure x86 variant
           wget -q \
-            "https://d.apkpure.net/b/APK/com.whatsapp?version=latest" \
+            "https://d.apkpure.net/b/APK/com.whatsapp?versionCode=latest&nc=arm64-v8a%2Cx86" \
             -O /tmp/whatsapp.apk \
-            --user-agent="Mozilla/5.0 (Linux; Android 13; Pixel 4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" \
+            --user-agent="Mozilla/5.0 (Linux; Android 9; x86_64 Build/PSR1.180720.117) AppleWebKit/537.36" \
             --timeout=120 \
             || true
 
-          if [ ! -f /tmp/whatsapp.apk ] || [ $(stat -c%s /tmp/whatsapp.apk) -lt 10000000 ]; then
-            echo "[APK] Primary source failed, trying fallback..."
-            wget -q \
-              "https://www.apkmirror.com/apk/whatsapp-inc/whatsapp/" \
-              -O /tmp/apkmirror_index.html \
-              --user-agent="Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36" \
-              --timeout=30 \
-              || true
+          APK_SIZE=$(stat -c%s /tmp/whatsapp.apk 2>/dev/null || echo 0)
+          echo "[APK] Attempt 1 size: ${APK_SIZE} bytes"
 
-            APK_PATH=$(grep -oP 'href="\K[^"]*download[^"]*(?=")' /tmp/apkmirror_index.html | head -1 || true)
-            if [ -n "$APK_PATH" ]; then
-              wget -q "https://www.apkmirror.com${APK_PATH}" \
-                -O /tmp/whatsapp.apk \
-                --user-agent="Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36" \
-                --timeout=120 \
-                || true
-            fi
+          # Fallback: download universal APK — will work on google_apis target
+          # which includes ARM translation (libhoudini)
+          if [ "$APK_SIZE" -lt 10000000 ]; then
+            echo "[APK] Trying universal APK..."
+            wget -q \
+              "https://d.apkpure.net/b/APK/com.whatsapp?version=latest" \
+              -O /tmp/whatsapp.apk \
+              --user-agent="Mozilla/5.0 (Linux; Android 9; x86_64 Build/PSR1.180720.117) AppleWebKit/537.36" \
+              --timeout=120 \
+              || true
+            APK_SIZE=$(stat -c%s /tmp/whatsapp.apk 2>/dev/null || echo 0)
+            echo "[APK] Attempt 2 size: ${APK_SIZE} bytes"
           fi
 
-          APK_SIZE=$(stat -c%s /tmp/whatsapp.apk 2>/dev/null || echo 0)
-          echo "[APK] Downloaded file size: ${APK_SIZE} bytes"
-
           if [ "$APK_SIZE" -lt 10000000 ]; then
-            echo "[APK] ERROR: APK download failed or file too small"
+            echo "[APK] ERROR: APK download failed"
             exit 1
           fi
 
-          echo "[APK] WhatsApp APK ready at /tmp/whatsapp.apk (${APK_SIZE} bytes)"
+          # Print APK native libs to confirm it has x86 support
+          unzip -p /tmp/whatsapp.apk "META-INF/MANIFEST.MF" 2>/dev/null | head -5 || true
+          unzip -l /tmp/whatsapp.apk | grep "lib/" | head -20 || true
+          echo "[APK] APK ready: ${APK_SIZE} bytes"
 
       - name: Run registration script
         id: registration
@@ -111,8 +108,11 @@ jobs:
           NODE_PORT: '3001'
         uses: reactivecircus/android-emulator-runner@v2
         with:
+          # google_apis target includes ARM translation (libhoudini/libhoudini)
+          # which allows ARM APKs to run on x86_64 emulators.
+          # This is the same target used by official Android Studio emulators.
           api-level: 29
-          target: default
+          target: google_apis
           arch: x86_64
           profile: pixel_4
           avd-name: wa_reg
@@ -122,7 +122,7 @@ jobs:
             -no-snapshot
             -noaudio
             -no-boot-anim
-            -memory 2048
+            -memory 3072
             -cores 2
           disable-animations: true
           emulator-boot-timeout: 600
