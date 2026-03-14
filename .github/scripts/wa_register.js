@@ -240,12 +240,16 @@ async function installWhatsApp() {
       console.log(`[SETUP] Install attempt ${attempt}/3...`);
       const result = run('adb install -r -t -g /tmp/whatsapp.apk', 300000);
       console.log(`[SETUP] Install output: ${result}`);
-      if (result.includes('Success') || result.includes('success')) {
+      // "Performing Streamed Install" followed by "Success" on next line
+      // result.includes covers both same-line and multi-line output
+      if (result.toLowerCase().includes('success')) {
         installed = true;
         break;
       }
-      // If output doesn't include Success, still consider it done if no error
-      if (!result.includes('FAILED') && !result.includes('Error')) {
+      // Also accept if no failure indicators present
+      if (!result.includes('FAILED') && !result.includes('Exception') &&
+          !result.includes('error') && result.length > 5) {
+        console.log('[SETUP] No explicit Success but no failure — assuming installed');
         installed = true;
         break;
       }
@@ -307,21 +311,31 @@ async function main() {
     // ── Launch WhatsApp ───────────────────────────────────────────────────
     console.log('[MAIN] Launching WhatsApp...');
 
-    // Go to home screen first to ensure clean state
+    // Clear logcat so we get clean output from WhatsApp launch
+    run('adb logcat -c', 5000);
+
+    // Go to home screen first
     run('adb shell input keyevent KEYCODE_HOME', 3000);
     await WAIT_MS(1000);
 
-    // Launch WhatsApp — use am start-activity which forces foreground
-    run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
-    await WAIT_MS(2000);
+    // Verify WhatsApp is actually installed before launching
+    const pkgCheck = run('adb shell pm list packages | grep whatsapp', 5000);
+    console.log(`[MAIN] WhatsApp package check: ${pkgCheck}`);
+    if (!pkgCheck.includes('com.whatsapp')) {
+      throw new Error('WhatsApp package not found after install — installation may have failed silently');
+    }
 
-    // Tap the center of the screen to dismiss any system overlay/dialog
-    run('adb shell input tap 540 1074', 3000);
-    await WAIT_MS(1000);
+    // Launch WhatsApp
+    const launchOut = run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
+    console.log(`[MAIN] Launch output: ${launchOut}`);
+    await WAIT_MS(6000);
 
-    // Re-launch to make sure it comes to foreground
-    run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
-    await WAIT_MS(5000);
+    // Capture logcat to see what WhatsApp is doing
+    const logcat = run('adb logcat -d -t 50 -s WhatsApp:* AndroidRuntime:E ActivityManager:I', 8000);
+    console.log(`[MAIN] Logcat after launch:
+${logcat}`);
+
+    await getCurrentScreen();
 
     // ── Dismiss crash dialog if WhatsApp keeps stopping ───────────────────
     // This happens when the APK architecture doesn't match the emulator.
