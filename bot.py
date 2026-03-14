@@ -513,10 +513,33 @@ async def main():
     await site.start()
     logger.info(f"Webhook server running on port {port}")
 
-    # Start Telegram polling
+    # ── Kill any stale polling session before starting ───────────────────────
+    # Render keeps the old container alive briefly during redeployment.
+    # Calling deleteWebhook with drop_pending_updates forces Telegram to
+    # terminate any existing getUpdates session, then we wait a few seconds
+    # for the old container to fully stop before starting our own poll.
     await application.initialize()
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Cleared any existing Telegram webhook/polling session")
+    except Exception as e:
+        logger.warning(f"delete_webhook failed (non-fatal): {e}")
+
+    logger.info("Waiting 8s for old container to terminate before polling...")
+    await asyncio.sleep(8)
+
     await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
+    await application.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message"],
+        # Use a longer timeout so the connection stays open longer,
+        # reducing the polling frequency and log noise
+        timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
     logger.info("Bot polling started")
 
     # Keep running

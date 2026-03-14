@@ -88,14 +88,32 @@ async def init_db():
 
 async def upsert_registration(telegram_user_id: int, phone_number: str, **kwargs):
     pool = await get_pool()
-    kwargs["updated_at"] = datetime.now(timezone.utc)
+
+    # Always strip updated_at from kwargs — the SQL hardcodes NOW() for it.
+    # Having it in both kwargs and the trailing ", updated_at = NOW()" causes
+    # "multiple assignments to same column" PostgresSyntaxError.
+    kwargs.pop("updated_at", None)
+
+    if not kwargs:
+        # Nothing to update beyond the conflict — just ensure row exists
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO registrations (telegram_user_id, phone_number)
+                   VALUES ($1, $2)
+                   ON CONFLICT (telegram_user_id, phone_number) DO UPDATE
+                   SET updated_at = NOW()""",
+                telegram_user_id, phone_number
+            )
+        return
+
+    # Build parameterised query: $1=user_id, $2=phone, $3..=kwargs values
     set_clauses = ", ".join(f"{k} = ${i+3}" for i, k in enumerate(kwargs))
     values = [telegram_user_id, phone_number] + list(kwargs.values())
     cols = ", ".join(["telegram_user_id", "phone_number"] + list(kwargs.keys()))
     placeholders = ", ".join(f"${i+1}" for i in range(len(values)))
     sql = f"""
-        INSERT INTO registrations ({cols})
-        VALUES ({placeholders})
+        INSERT INTO registrations ({cols}, updated_at)
+        VALUES ({placeholders}, NOW())
         ON CONFLICT (telegram_user_id, phone_number)
         DO UPDATE SET {set_clauses}, updated_at = NOW()
     """
