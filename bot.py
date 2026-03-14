@@ -363,6 +363,19 @@ async def webhook_handler(request: web.Request) -> web.Response:
         msg_id = reg.get("otp_message_id") or reg.get("first_message_id")
         before = utils.msg_processing(phone)
         after = utils.msg_bad_number(phone)
+
+        # Distinguish between a cancellation and a genuine failure in logs
+        if "cancelled" in reason.lower():
+            logger.warning(
+                f"[REGISTRATION CANCELLED] {phone} | run_id={data.get('run_id', 'n/a')} | "
+                f"Reason: {reason}"
+            )
+        else:
+            logger.error(
+                f"[REGISTRATION FAILED] {phone} | run_id={data.get('run_id', 'n/a')} | "
+                f"Reason: {reason}"
+            )
+
         await edit_message_logged(bot, chat_id, msg_id, before, after,
                                    phone, user_id, f"Bad number — {reason}")
         await db.update_status(user_id, phone, "BAD_NUMBER")
