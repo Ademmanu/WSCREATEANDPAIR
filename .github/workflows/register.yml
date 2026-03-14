@@ -41,9 +41,6 @@ jobs:
             adb android-tools-adb curl jq wget unzip
 
       - name: Install Node dependencies
-        # npm ci requires a lockfile — use npm install instead.
-        # PUPPETEER_SKIP_CHROMIUM_DOWNLOAD stops Puppeteer downloading
-        # its own Chromium on the runner (we use ADB/emulator, not Puppeteer here).
         env:
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
         run: npm install --omit=dev
@@ -52,7 +49,6 @@ jobs:
         run: |
           echo "[APK] Downloading latest WhatsApp APK..."
 
-          # Primary source — APKPure direct download
           wget -q \
             "https://d.apkpure.net/b/APK/com.whatsapp?version=latest" \
             -O /tmp/whatsapp.apk \
@@ -60,11 +56,8 @@ jobs:
             --timeout=120 \
             || true
 
-          # Check if download succeeded and file is a valid APK (ZIP format)
           if [ ! -f /tmp/whatsapp.apk ] || [ $(stat -c%s /tmp/whatsapp.apk) -lt 10000000 ]; then
-            echo "[APK] Primary source failed or file too small, trying fallback..."
-
-            # Fallback — APKMirror via direct link pattern
+            echo "[APK] Primary source failed, trying fallback..."
             wget -q \
               "https://www.apkmirror.com/apk/whatsapp-inc/whatsapp/" \
               -O /tmp/apkmirror_index.html \
@@ -72,9 +65,7 @@ jobs:
               --timeout=30 \
               || true
 
-            # Extract the first APK download link from the page
             APK_PATH=$(grep -oP 'href="\K[^"]*download[^"]*(?=")' /tmp/apkmirror_index.html | head -1 || true)
-
             if [ -n "$APK_PATH" ]; then
               wget -q "https://www.apkmirror.com${APK_PATH}" \
                 -O /tmp/whatsapp.apk \
@@ -84,18 +75,26 @@ jobs:
             fi
           fi
 
-          # Final size check
           APK_SIZE=$(stat -c%s /tmp/whatsapp.apk 2>/dev/null || echo 0)
           echo "[APK] Downloaded file size: ${APK_SIZE} bytes"
 
           if [ "$APK_SIZE" -lt 10000000 ]; then
-            echo "[APK] ERROR: APK download failed or file is too small (< 10MB)"
+            echo "[APK] ERROR: APK download failed or file too small"
             exit 1
           fi
 
           echo "[APK] WhatsApp APK ready at /tmp/whatsapp.apk (${APK_SIZE} bytes)"
 
-      - name: Set up Android SDK + emulator
+      - name: Run registration script
+        id: registration
+        env:
+          PHONE_NUMBER: ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
+          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
+          NODE_PORT: '3001'
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 33
@@ -111,11 +110,48 @@ jobs:
             -no-boot-anim
           disable-animations: true
           script: node .github/scripts/wa_register.js
+
+      # ── Fires only when the registration step fails (script crash, emulator
+      #    error, APK install failure, etc.) ──────────────────────────────────
+      - name: Notify bot — registration failed
+        if: failure()
         env:
-          PHONE_NUMBER: ${{ inputs.phone_number }}
-          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
           WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
           WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+          PHONE_NUMBER: ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
-          NODE_PORT: '3001'
+        run: |
+          echo "[FAILURE] Registration failed for $PHONE_NUMBER — notifying bot"
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            -d "{
+              \"event\": \"bad_number\",
+              \"phone_number\": \"$PHONE_NUMBER\",
+              \"telegram_user_id\": $TELEGRAM_USER_ID,
+              \"run_id\": \"$GITHUB_RUN_ID\",
+              \"reason\": \"GitHub Actions workflow failed — emulator or script error\"
+            }"
+
+      # ── Fires only when the job is cancelled (manual cancel or timeout) ────
+      - name: Notify bot — registration cancelled
+        if: cancelled()
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+          PHONE_NUMBER: ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "[CANCELLED] Registration cancelled for $PHONE_NUMBER — notifying bot"
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            -d "{
+              \"event\": \"bad_number\",
+              \"phone_number\": \"$PHONE_NUMBER\",
+              \"telegram_user_id\": $TELEGRAM_USER_ID,
+              \"run_id\": \"$GITHUB_RUN_ID\",
+              \"reason\": \"GitHub Actions workflow was cancelled\"
+            }"
