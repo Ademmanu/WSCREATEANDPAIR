@@ -40,6 +40,56 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             adb android-tools-adb curl jq wget unzip
 
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Download WhatsApp APK
+        run: |
+          echo "[APK] Downloading latest WhatsApp APK..."
+
+          # Primary source — APKPure direct download
+          wget -q \
+            "https://d.apkpure.net/b/APK/com.whatsapp?version=latest" \
+            -O /tmp/whatsapp.apk \
+            --user-agent="Mozilla/5.0 (Linux; Android 13; Pixel 4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" \
+            --timeout=120 \
+            || true
+
+          # Check if download succeeded and file is a valid APK (ZIP format)
+          if [ ! -f /tmp/whatsapp.apk ] || [ $(stat -c%s /tmp/whatsapp.apk) -lt 10000000 ]; then
+            echo "[APK] Primary source failed or file too small, trying fallback..."
+
+            # Fallback — APKMirror via direct link pattern
+            wget -q \
+              "https://www.apkmirror.com/apk/whatsapp-inc/whatsapp/" \
+              -O /tmp/apkmirror_index.html \
+              --user-agent="Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36" \
+              --timeout=30 \
+              || true
+
+            # Extract the first APK download link from the page
+            APK_PATH=$(grep -oP 'href="\K[^"]*download[^"]*(?=")' /tmp/apkmirror_index.html | head -1 || true)
+
+            if [ -n "$APK_PATH" ]; then
+              wget -q "https://www.apkmirror.com${APK_PATH}" \
+                -O /tmp/whatsapp.apk \
+                --user-agent="Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36" \
+                --timeout=120 \
+                || true
+            fi
+          fi
+
+          # Final size check
+          APK_SIZE=$(stat -c%s /tmp/whatsapp.apk 2>/dev/null || echo 0)
+          echo "[APK] Downloaded file size: ${APK_SIZE} bytes"
+
+          if [ "$APK_SIZE" -lt 10000000 ]; then
+            echo "[APK] ERROR: APK download failed or file is too small (< 10MB)"
+            exit 1
+          fi
+
+          echo "[APK] WhatsApp APK ready at /tmp/whatsapp.apk (${APK_SIZE} bytes)"
+
       - name: Set up Android SDK + emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -56,7 +106,6 @@ jobs:
             -no-boot-anim
           disable-animations: true
           script: node .github/scripts/wa_register.js
-
         env:
           PHONE_NUMBER: ${{ inputs.phone_number }}
           TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
