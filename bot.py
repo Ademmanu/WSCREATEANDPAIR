@@ -538,8 +538,8 @@ async def main():
     except Exception as e:
         logger.warning(f"delete_webhook failed (non-fatal): {e}")
 
-    logger.info("Waiting 80s for old container to terminate before polling...")
-    await asyncio.sleep(80)
+    logger.info("Waiting 100s for old container to terminate before polling...")
+    await asyncio.sleep(100)
 
     await application.start()
     await application.updater.start_polling(
