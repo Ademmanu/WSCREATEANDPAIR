@@ -33,6 +33,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Suppress noisy loggers ────────────────────────────────────────────────────
+# Render health checks, UptimeRobot pings, and Telegram long-poll are all
+# expected and produce no useful signal — hide them.
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.vendor.ptb_urllib3").setLevel(logging.WARNING)
+
+class _HealthFilter(logging.Filter):
+    """Drop /health GET log records from aiohttp.access."""
+    def filter(self, record):
+        return "/health" not in record.getMessage()
+
+logging.getLogger("aiohttp.access").addFilter(_HealthFilter())
+
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
