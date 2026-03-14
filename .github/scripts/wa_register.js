@@ -235,7 +235,9 @@ async function installWhatsApp() {
   await WAIT_MS(3000);
 
   // First check APK architecture to understand what we are installing
-  const libFolders = run('unzip -l /tmp/whatsapp.apk 2>/dev/null | grep "lib/" | awk '{print $4}' | cut -d/ -f1-2 | sort -u', 10000);
+  fs.writeFileSync('/tmp/check_apk.sh', 'unzip -l /tmp/whatsapp.apk 2>/dev/null | grep "lib/" | cut -d/ -f1-3 | sort -u\n');
+  const libFolders = run('sh /tmp/check_apk.sh', 10000);
+  console.log(`[SETUP] APK native libs: ${libFolders || '(none — may be pure Java APK)'}`);
   console.log(`[SETUP] APK native libs: ${libFolders || '(none found — may be pure Java APK)'}`);
 
   let installed = false;
