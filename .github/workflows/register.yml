@@ -53,48 +53,25 @@ jobs:
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
         run: npm install --omit=dev
 
-      - name: Download WhatsApp x86 APK
+      - name: Download WhatsApp APK from GitHub Release
         run: |
-          echo "[APK] Downloading WhatsApp x86 APK for emulator..."
+          echo "[APK] Downloading WhatsApp APK from repo release..."
+          REPO="${{ github.repository }}"
 
-          # WhatsApp publishes a universal APK and separate arch-specific ones.
-          # For x86_64 emulators we need the x86 or x86_64 variant.
-          # APKPure serves the universal ARM APK by default — we must request x86.
-
-          # Try APKPure x86 variant
-          wget -q \
-            "https://d.apkpure.net/b/APK/com.whatsapp?versionCode=latest&nc=arm64-v8a%2Cx86" \
-            -O /tmp/whatsapp.apk \
-            --user-agent="Mozilla/5.0 (Linux; Android 9; x86_64 Build/PSR1.180720.117) AppleWebKit/537.36" \
-            --timeout=120 \
-            || true
+          wget -q             "https://github.com/${REPO}/releases/download/whatsapp/whatsapp.apk"             -O /tmp/whatsapp.apk             --user-agent="Mozilla/5.0"             --timeout=180             || true
 
           APK_SIZE=$(stat -c%s /tmp/whatsapp.apk 2>/dev/null || echo 0)
-          echo "[APK] Attempt 1 size: ${APK_SIZE} bytes"
-
-          # Fallback: download universal APK — will work on google_apis target
-          # which includes ARM translation (libhoudini)
-          if [ "$APK_SIZE" -lt 10000000 ]; then
-            echo "[APK] Trying universal APK..."
-            wget -q \
-              "https://d.apkpure.net/b/APK/com.whatsapp?version=latest" \
-              -O /tmp/whatsapp.apk \
-              --user-agent="Mozilla/5.0 (Linux; Android 9; x86_64 Build/PSR1.180720.117) AppleWebKit/537.36" \
-              --timeout=120 \
-              || true
-            APK_SIZE=$(stat -c%s /tmp/whatsapp.apk 2>/dev/null || echo 0)
-            echo "[APK] Attempt 2 size: ${APK_SIZE} bytes"
-          fi
+          echo "[APK] Downloaded size: ${APK_SIZE} bytes"
 
           if [ "$APK_SIZE" -lt 10000000 ]; then
-            echo "[APK] ERROR: APK download failed"
+            echo "[APK] ERROR: APK not found in releases."
+            echo "[APK] Upload whatsapp.apk to: https://github.com/${REPO}/releases/tag/whatsapp"
             exit 1
           fi
 
-          # Print APK native libs to confirm it has x86 support
-          unzip -p /tmp/whatsapp.apk "META-INF/MANIFEST.MF" 2>/dev/null | head -5 || true
-          unzip -l /tmp/whatsapp.apk | grep "lib/" | head -20 || true
-          echo "[APK] APK ready: ${APK_SIZE} bytes"
+          echo "[APK] Native lib folders:"
+          unzip -l /tmp/whatsapp.apk 2>/dev/null | grep "lib/" | awk '{print $4}' | cut -d/ -f1-2 | sort -u || true
+          echo "[APK] Ready: ${APK_SIZE} bytes"
 
       - name: Run registration script
         id: registration
@@ -124,6 +101,10 @@ jobs:
             -no-boot-anim
             -memory 3072
             -cores 2
+          # Disable lock screen at AVD level before boot
+          pre-emulator-launch-script: |
+            echo "hw.mainKeys=no" >> ~/.android/avd/wa_reg.avd/config.ini
+            echo "lockScreen.disabled=true" >> ~/.android/avd/wa_reg.avd/config.ini
           disable-animations: true
           emulator-boot-timeout: 600
           script: node .github/scripts/wa_register.js
