@@ -307,57 +307,21 @@ async function main() {
     // ── Launch WhatsApp ───────────────────────────────────────────────────
     console.log('[MAIN] Launching WhatsApp...');
 
-    // Dismiss any Google Play / system dialogs that appear on google_apis images
-    // before launching WhatsApp
-    run('adb shell input keyevent KEYCODE_BACK', 3000);
-    await WAIT_MS(500);
+    // Go to home screen first to ensure clean state
     run('adb shell input keyevent KEYCODE_HOME', 3000);
     await WAIT_MS(1000);
 
-    // Launch WhatsApp via am start
-    const launchResult = run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
-    console.log(`[MAIN] Launch result: ${launchResult}`);
-    await WAIT_MS(3000);
+    // Launch WhatsApp — use am start-activity which forces foreground
+    run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
+    await WAIT_MS(2000);
 
-    // Log full XML dump once so we can see exactly what is on screen
-    console.log('[MAIN] Full UI dump after launch:');
-    const launchDump = run('adb shell uiautomator dump /sdcard/ui.xml && adb shell cat /sdcard/ui.xml', 10000);
-    console.log(launchDump.substring(0, 3000));
+    // Tap the center of the screen to dismiss any system overlay/dialog
+    run('adb shell input tap 540 1074', 3000);
+    await WAIT_MS(1000);
 
-    // Check what package is in the foreground
-    const focused = run('adb shell dumpsys window windows | grep -E "mCurrentFocus|mFocusedApp"', 5000);
-    console.log(`[MAIN] Focused window: ${focused}`);
-
-    // If WhatsApp is not focused, try bringing it forward
-    if (!focused.includes('com.whatsapp')) {
-      console.log('[MAIN] WhatsApp not in foreground — retrying...');
-      run('adb shell am force-stop com.whatsapp', 5000);
-      await WAIT_MS(2000);
-      run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
-      await WAIT_MS(5000);
-      const focused2 = run('adb shell dumpsys window windows | grep -E "mCurrentFocus|mFocusedApp"', 5000);
-      console.log(`[MAIN] Focused window after retry: ${focused2}`);
-    }
-
-    // Wait up to 20s for WhatsApp to appear in foreground
-    let waVisible = false;
-    for (let i = 0; i < 10; i++) {
-      await WAIT_MS(2000);
-      const foc = run('adb shell dumpsys window windows | grep mCurrentFocus', 5000);
-      console.log(`[MAIN] Current focus: ${foc}`);
-      if (foc.includes('com.whatsapp')) {
-        console.log('[MAIN] WhatsApp is in foreground');
-        waVisible = true;
-        break;
-      }
-    }
-
-    if (!waVisible) {
-      // Last resort — dump full screen for debugging
-      console.log('[MAIN] WhatsApp never reached foreground. Full XML:');
-      const finalDump = run('adb shell uiautomator dump /sdcard/ui.xml && adb shell cat /sdcard/ui.xml', 10000);
-      console.log(finalDump.substring(0, 5000));
-    }
+    // Re-launch to make sure it comes to foreground
+    run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
+    await WAIT_MS(5000);
 
     // ── Dismiss crash dialog if WhatsApp keeps stopping ───────────────────
     // This happens when the APK architecture doesn't match the emulator.
