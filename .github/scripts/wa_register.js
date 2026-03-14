@@ -307,50 +307,56 @@ async function main() {
     // ── Launch WhatsApp ───────────────────────────────────────────────────
     console.log('[MAIN] Launching WhatsApp...');
 
-    // Use am start with explicit activity — more reliable than monkey
-    // Try the main entry points used across WhatsApp versions
-    const launchCmds = [
-      `adb shell am start -n com.whatsapp/com.whatsapp.Main`,
-      `adb shell am start -n com.whatsapp/com.whatsapp.registration.VerifyPhoneNumber`,
-      `adb shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.whatsapp/.Main`,
-      `adb shell monkey -p com.whatsapp -c android.intent.category.LAUNCHER 1`,
-    ];
+    // Dismiss any Google Play / system dialogs that appear on google_apis images
+    // before launching WhatsApp
+    run('adb shell input keyevent KEYCODE_BACK', 3000);
+    await WAIT_MS(500);
+    run('adb shell input keyevent KEYCODE_HOME', 3000);
+    await WAIT_MS(1000);
 
-    for (const cmd of launchCmds) {
-      console.log(`[MAIN] Trying launch: ${cmd}`);
-      const result = run(cmd, 10000);
-      console.log(`[MAIN] Launch result: ${result}`);
-      if (!result.includes('Error') && !result.includes('does not exist')) break;
-      await WAIT_MS(1000);
+    // Launch WhatsApp via am start
+    const launchResult = run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
+    console.log(`[MAIN] Launch result: ${launchResult}`);
+    await WAIT_MS(3000);
+
+    // Log full XML dump once so we can see exactly what is on screen
+    console.log('[MAIN] Full UI dump after launch:');
+    const launchDump = run('adb shell uiautomator dump /sdcard/ui.xml && adb shell cat /sdcard/ui.xml', 10000);
+    console.log(launchDump.substring(0, 3000));
+
+    // Check what package is in the foreground
+    const focused = run('adb shell dumpsys window windows | grep -E "mCurrentFocus|mFocusedApp"', 5000);
+    console.log(`[MAIN] Focused window: ${focused}`);
+
+    // If WhatsApp is not focused, try bringing it forward
+    if (!focused.includes('com.whatsapp')) {
+      console.log('[MAIN] WhatsApp not in foreground — retrying...');
+      run('adb shell am force-stop com.whatsapp', 5000);
+      await WAIT_MS(2000);
+      run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
+      await WAIT_MS(5000);
+      const focused2 = run('adb shell dumpsys window windows | grep -E "mCurrentFocus|mFocusedApp"', 5000);
+      console.log(`[MAIN] Focused window after retry: ${focused2}`);
     }
 
-    // Wait for WhatsApp to render — give it up to 30s to show anything
-    console.log('[MAIN] Waiting for WhatsApp to render...');
+    // Wait up to 20s for WhatsApp to appear in foreground
     let waVisible = false;
-    for (let i = 0; i < 15; i++) {
+    for (let i = 0; i < 10; i++) {
       await WAIT_MS(2000);
-      const xml = await dumpUI(5000);
-      // WhatsApp is visible if screen no longer shows home screen apps
-      if (xml && !xml.includes('WebView Browser Tester') && xml.length > 500) {
-        console.log('[MAIN] WhatsApp is rendering');
+      const foc = run('adb shell dumpsys window windows | grep mCurrentFocus', 5000);
+      console.log(`[MAIN] Current focus: ${foc}`);
+      if (foc.includes('com.whatsapp')) {
+        console.log('[MAIN] WhatsApp is in foreground');
         waVisible = true;
         break;
       }
-      // If still on home screen, try tapping the WhatsApp icon directly
-      if (i === 5) {
-        console.log('[MAIN] Still on home screen — retrying launch via am start');
-        run(`adb shell am start -n com.whatsapp/com.whatsapp.Main`, 10000);
-      }
-      await getCurrentScreen();
     }
 
     if (!waVisible) {
-      // Last resort: force-stop and restart
-      console.log('[MAIN] WhatsApp not visible — force stopping and restarting');
-      run(`adb shell am force-stop ${WA_PACKAGE}`, 5000);
-      await WAIT_MS(2000);
-      run(`adb shell am start -n com.whatsapp/com.whatsapp.Main`, 10000);
-      await WAIT_MS(8000);
+      // Last resort — dump full screen for debugging
+      console.log('[MAIN] WhatsApp never reached foreground. Full XML:');
+      const finalDump = run('adb shell uiautomator dump /sdcard/ui.xml && adb shell cat /sdcard/ui.xml', 10000);
+      console.log(finalDump.substring(0, 5000));
     }
 
     // ── Dismiss crash dialog if WhatsApp keeps stopping ───────────────────
