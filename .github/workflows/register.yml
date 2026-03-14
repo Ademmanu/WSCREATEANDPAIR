@@ -34,6 +34,20 @@ jobs:
         with:
           node-version: '20'
 
+      # ── Enable KVM hardware virtualisation ──────────────────────────────────
+      # Without this the emulator falls back to TCG software emulation which
+      # cannot boot Android. GitHub ubuntu-latest runners support KVM but it
+      # must be explicitly enabled via udev rules.
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          # Verify KVM is accessible
+          ls -la /dev/kvm
+          grep -c ^processor /proc/cpuinfo
+
       - name: Install ADB + emulator tools
         run: |
           sudo apt-get update -qq
@@ -97,27 +111,26 @@ jobs:
           NODE_PORT: '3001'
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          # API 29 boots in ~90s on GitHub runners vs 5-8min for API 33.
-          # WhatsApp supports Android 5.0+ so API 29 works fine.
-          # 'default' target has no Google Play overhead — boots faster.
+          # API 29, x86 arch — most stable combination on GitHub KVM runners.
+          # x86_64 triggers AVX/f16c TCG warnings and stalls; x86 avoids this.
+          # 'default' target — no Google Play overhead, faster boot.
           api-level: 29
           target: default
-          arch: x86_64
+          arch: x86
           profile: pixel_4
           avd-name: wa_reg
-          # 'swiftshader' (not swiftshader_indirect) is faster on CI runners.
-          # -no-snapshot disables snapshot save/load which hangs on cold runners.
-          # -memory 2048 gives the emulator enough RAM to run WhatsApp.
+          # -gpu host uses KVM-accelerated GPU passthrough (requires KVM step above).
+          # -no-snapshot prevents stale snapshot issues on fresh runners.
+          # -memory 3072 gives WhatsApp enough RAM to initialise.
           emulator-options: >
             -no-window
-            -gpu swiftshader
+            -gpu host
             -no-snapshot
             -noaudio
             -no-boot-anim
-            -memory 2048
+            -memory 3072
             -cores 2
           disable-animations: true
-          # Wait up to 600s (10 min) for boot before failing
           emulator-boot-timeout: 600
           script: node .github/scripts/wa_register.js
 
