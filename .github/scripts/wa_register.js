@@ -322,7 +322,7 @@ async function main() {
     if (!phoneScreenXml) {
       await getCurrentScreen();
       await sendWebhook('bad_number', { reason: 'Phone number entry screen not found after agree' });
-      process.exit(1);
+      process.exit(0); // exit(0) — bot already notified, skip if:failure() step
     }
 
     console.log('[MAIN] Phone number screen found');
@@ -417,7 +417,7 @@ async function main() {
     if (!otpScreenFound) {
       await getCurrentScreen();
       await sendWebhook('bad_number', { reason: 'OTP screen not reached after phone entry' });
-      process.exit(1);
+      process.exit(0); // exit(0) — bot already notified, skip if:failure() step
     }
 
     // ── Notify bot OTP was sent ───────────────────────────────────────────
@@ -489,7 +489,7 @@ async function main() {
     console.error('[MAIN] Fatal error:', err.message);
     console.error(err.stack);
     await sendWebhook('bad_number', { reason: `Script error: ${err.message}` });
-    process.exit(1);
+    process.exit(0); // exit(0) — bot already notified, skip if:failure() step
   }
 }
 
