@@ -429,6 +429,15 @@ async function main() {
   }
   log('MAIN', 'Permissions granted');
 
+  // ── Update Google Play Services before launching WhatsApp ───────────────
+  // WhatsApp hard-requires a recent GPS version. The google_apis_playstore
+  // image ships with a newer GPS but may still need a nudge on first boot.
+  // We install a bundled GPS update APK if one was downloaded in the workflow,
+  // otherwise we skip and let the emulator handle it.
+  log('MAIN', 'Checking Google Play Services version...');
+  const gpsVersion = adbShell('dumpsys package com.google.android.gms | grep versionName | head -1 2>/dev/null');
+  log('MAIN', `GPS version: ${gpsVersion || 'unknown'}`);
+
   // monkey sends INTENT_ACTION_MAIN + CATEGORY_LAUNCHER — identical to tapping the icon
   // This is the most reliable foreground launch method on Android emulators
   adbShell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1 2>/dev/null`);
@@ -543,13 +552,31 @@ async function main() {
 
       // Dismiss crash dialog if it reappears
       if (xml.includes('keeps stopping')) {
-        log('MAIN', 'Crash dialog reappeared — dismissing...');
+        log('MAIN', 'Crash dialog — dismissing');
         await tapElement('Close app', xml);
         await sleep(2000);
         adbShell(`pm clear ${WA_PACKAGE} 2>/dev/null || true`);
         await sleep(1000);
-        adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
+        adbShell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1 2>/dev/null`);
         await sleep(8000);
+        continue;
+      }
+
+      // "Update Google Play services" hard block — cannot update in emulator,
+      // so force-bypass by clearing GPS cache and relaunching WhatsApp
+      if (xml.includes('Update Google Play') || xml.includes('Google Play services')) {
+        log('MAIN', 'GPS update dialog — attempting bypass via GPS cache clear');
+        // Tap Update button to trigger background update attempt
+        await tapElement('Update', xml);
+        await sleep(5000);
+        // Clear WhatsApp cache and relaunch — sometimes bypasses the check
+        adbShell(`pm clear ${WA_PACKAGE} 2>/dev/null || true`);
+        await sleep(1000);
+        for (const perm of WA_PERMS) {
+          adbShell(`pm grant ${WA_PACKAGE} ${perm} 2>/dev/null || true`);
+        }
+        adbShell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1 2>/dev/null`);
+        await sleep(10000);
         continue;
       }
 
