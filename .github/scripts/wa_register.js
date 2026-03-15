@@ -388,37 +388,122 @@ async function main() {
 
   // ── 4. Launch WhatsApp ───────────────────────────────────────────────────
   log('MAIN', 'Launching WhatsApp...');
+
+  // Dismiss any pending system dialogs (Google Play updates etc.)
+  keyevent('KEYCODE_BACK');
+  await sleep(300);
   keyevent('KEYCODE_HOME');
+  await sleep(1000);
+
+  // Grant WhatsApp permissions upfront so it does not show permission dialogs
+  for (const perm of [
+    'android.permission.READ_CONTACTS',
+    'android.permission.WRITE_CONTACTS',
+    'android.permission.READ_PHONE_STATE',
+    'android.permission.CALL_PHONE',
+    'android.permission.CAMERA',
+    'android.permission.RECORD_AUDIO',
+    'android.permission.READ_EXTERNAL_STORAGE',
+    'android.permission.WRITE_EXTERNAL_STORAGE',
+    'android.permission.RECEIVE_SMS',
+    'android.permission.READ_SMS',
+    'android.permission.SEND_SMS',
+  ]) {
+    adbShell(`pm grant ${WA_PACKAGE} ${perm} 2>/dev/null || true`);
+  }
+  log('MAIN', 'Permissions granted');
   await sleep(500);
-  adbShell(`am start -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
-  await sleep(5000);
+
+  // Launch using am start with FLAG_ACTIVITY_NEW_TASK to force foreground
+  adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main --activity-clear-top 2>/dev/null || am start -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
+  log('MAIN', 'am start sent — waiting for WhatsApp to render...');
+  await sleep(8000);
   await logScreen('LAUNCH');
 
-  // ── 5. Accept terms ──────────────────────────────────────────────────────
-  const agreeResult = await waitForAny(
-    ['AGREE AND CONTINUE', 'Agree and continue', 'Accept', 'I agree', 'AGREE'],
-    20000
+  // If still on home screen, force-stop and relaunch
+  const launchTexts = await screenTexts();
+  const onHomeScreen = launchTexts.some(t =>
+    t.includes('Messages') || t.includes('Chrome') || t.includes('Sunday') ||
+    t.includes('Monday') || t.includes('Tuesday') || t.includes('Wednesday') ||
+    t.includes('Thursday') || t.includes('Friday') || t.includes('Saturday')
   );
+
+  if (onHomeScreen) {
+    log('MAIN', 'Still on home screen — force-stopping and retrying...');
+    adbShell(`am force-stop ${WA_PACKAGE}`);
+    await sleep(2000);
+    adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
+    await sleep(10000);
+    await logScreen('RELAUNCH');
+  }
+
+  // ── 5. Accept terms ──────────────────────────────────────────────────────
+  // Wait up to 30s for WhatsApp agree screen — also handle Google dialogs
+  const agreeResult = await waitForAny([
+    'AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree',
+    // WhatsApp sometimes shows these first
+    'Enter your phone number', 'Your phone number', 'Phone number', 'Country',
+    // Google Play dialogs that block WhatsApp
+    'Update', 'Skip', 'Not now', 'Cancel',
+  ], 30000);
+
   if (agreeResult.matched) {
-    await tapElement(agreeResult.matched, agreeResult.xml);
-    await sleep(3000);
+    log('MAIN', `Screen shows: "${agreeResult.matched}"`);
+    // Dismiss Google Play / update dialogs first
+    if (['Update', 'Skip', 'Not now', 'Cancel'].includes(agreeResult.matched)) {
+      await tapElement('Skip', agreeResult.xml) ||
+      await tapElement('Not now', agreeResult.xml) ||
+      await tapElement('Cancel', agreeResult.xml);
+      await sleep(3000);
+      // Now launch WhatsApp again
+      adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
+      await sleep(6000);
+    }
+    // Tap agree if present
+    const agreeXml = await dumpUI();
+    for (const btn of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree']) {
+      if (agreeXml.includes(btn)) {
+        await tapElement(btn, agreeXml);
+        await sleep(4000);
+        break;
+      }
+    }
     await logScreen('POST-AGREE');
   }
 
   // ── 6. Phone number entry ────────────────────────────────────────────────
   log('MAIN', 'Waiting for phone number screen...');
-  const phoneResult = await waitForAny([
-    'Enter your phone number',
-    'Your phone number',
-    'Phone number',
-    'phone number',
-    'Country',
-    'country code',
-  ], 60000);
+
+  // Poll for up to 90 seconds — WhatsApp can be slow on first launch
+  let phoneResult = { matched: null, xml: '' };
+  const phoneDeadline = Date.now() + 90000;
+  while (Date.now() < phoneDeadline && !phoneResult.matched) {
+    const xml = await dumpUI();
+    const xmlLower = xml.toLowerCase();
+    for (const text of [
+      'Enter your phone number', 'Your phone number', 'Phone number',
+      'phone number', 'Country', 'country code', 'enter phone',
+    ]) {
+      if (xmlLower.includes(text.toLowerCase())) {
+        phoneResult = { matched: text, xml };
+        break;
+      }
+    }
+    if (!phoneResult.matched) {
+      const visible = await screenTexts();
+      log('MAIN', `Still waiting for phone screen... visible: ${visible.slice(0, 5).join(' | ')}`);
+      // Tap agree again in case it re-appeared
+      if (xml.includes('AGREE') || xml.includes('Agree')) {
+        await tapElement('AGREE AND CONTINUE', xml) || await tapElement('Agree and continue', xml);
+        await sleep(3000);
+      }
+      await sleep(3000);
+    }
+  }
 
   if (!phoneResult.matched) {
     await logScreen('ERROR');
-    await webhook('bad_number', { reason: 'Phone entry screen not found' });
+    await webhook('bad_number', { reason: 'Phone entry screen not found after 90s' });
     process.exit(0);
   }
 
