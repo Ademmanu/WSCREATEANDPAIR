@@ -465,23 +465,47 @@ async function main() {
   }
 
 
-  // ── 5. Accept terms ──────────────────────────────────────────────────────
+  // ── 5. Dismiss system alerts then accept terms ───────────────────────────
+  // google_apis emulators show "Alert / OK / More info" (Google Play Services
+  // outdated) before WhatsApp renders. Tap OK up to 5 times to clear it.
+  log('MAIN', 'Dismissing any system alert dialogs...');
+  for (let i = 0; i < 5; i++) {
+    const alertXml = await dumpUI(4000);
+    if (alertXml.includes('Alert') || alertXml.includes('More info') ||
+        alertXml.includes('Google Play') || alertXml.includes('Update')) {
+      log('MAIN', `Alert dialog (attempt ${i+1}) — tapping OK`);
+      const dismissed =
+        await tapElement('OK', alertXml) ||
+        await tapElement('Skip', alertXml) ||
+        await tapElement('Not now', alertXml) ||
+        await tapElement('Cancel', alertXml) ||
+        await tapElement('Close', alertXml);
+      if (!dismissed) tap(540, 1200); // fallback center tap
+      await sleep(2000);
+    } else {
+      break;
+    }
+  }
+
+  // Language screen arrow (newer WhatsApp versions)
+  const langXml2 = await dumpUI(4000);
+  if (langXml2.includes('Choose your language') || langXml2.includes('Welcome to WhatsApp')) {
+    log('MAIN', 'Language screen — tapping arrow');
+    const arrowTapped =
+      await tapElement('next', langXml2) ||
+      await tapElement('Next', langXml2) ||
+      await tapElement('Continue', langXml2);
+    if (!arrowTapped) tap(108, 2100);
+    await sleep(3000);
+  }
+
   const agreeResult = await waitForAny([
     'AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree',
     'Enter your phone number', 'Your phone number', 'Phone number', 'Country',
-    'Update', 'Skip', 'Not now', 'Cancel',
   ], 30000);
 
   if (agreeResult.matched) {
-    log('MAIN', `Screen shows: "${agreeResult.matched}"`);
-    if (['Update', 'Skip', 'Not now', 'Cancel'].includes(agreeResult.matched)) {
-      await tapElement('Skip', agreeResult.xml) ||
-      await tapElement('Not now', agreeResult.xml) ||
-      await tapElement('Cancel', agreeResult.xml);
-      await sleep(3000);
-      adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
-      await sleep(6000);
-    }
+    log('MAIN', `Agree/phone screen: "${agreeResult.matched}"`);
     const agreeXml = await dumpUI();
     for (const btn of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree']) {
       if (agreeXml.includes(btn)) {
@@ -494,6 +518,8 @@ async function main() {
   }
 
   // ── 6. Phone number entry ────────────────────────────────────────────────
+  log('MAIN', 'Waiting for phone number screen...');
+
   log('MAIN', 'Waiting for phone number screen...');
 
   // Poll for up to 90 seconds — WhatsApp can be slow on first launch
