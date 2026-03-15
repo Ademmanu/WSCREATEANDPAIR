@@ -465,41 +465,97 @@ async function main() {
   }
 
 
-  // ── 5. Accept terms ──────────────────────────────────────────────────────
-  // Wait up to 30s for WhatsApp agree screen — also handle Google dialogs
-  const agreeResult = await waitForAny([
-    'AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree',
-    // WhatsApp sometimes shows these first
-    'Enter your phone number', 'Your phone number', 'Phone number', 'Country',
-    // Google Play dialogs that block WhatsApp
-    'Update', 'Skip', 'Not now', 'Cancel',
-  ], 30000);
+  // ── 5. Handle language picker + accept terms ────────────────────────────
+  // Newer WhatsApp versions show a language selection screen first.
+  // We wait for ANY of these screens and handle each appropriately.
+  log('MAIN', 'Handling language/agree screens...');
 
-  if (agreeResult.matched) {
-    log('MAIN', `Screen shows: "${agreeResult.matched}"`);
-    // Dismiss Google Play / update dialogs first
-    if (['Update', 'Skip', 'Not now', 'Cancel'].includes(agreeResult.matched)) {
-      await tapElement('Skip', agreeResult.xml) ||
-      await tapElement('Not now', agreeResult.xml) ||
-      await tapElement('Cancel', agreeResult.xml);
-      await sleep(3000);
-      // Now launch WhatsApp again
-      adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
-      await sleep(6000);
-    }
-    // Tap agree if present
-    const agreeXml = await dumpUI();
-    for (const btn of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree']) {
-      if (agreeXml.includes(btn)) {
-        await tapElement(btn, agreeXml);
-        await sleep(4000);
-        break;
+  // Loop to handle multiple screens in sequence (language → agree → phone)
+  let onPhoneScreen = false;
+  const screenDeadline = Date.now() + 90000;
+
+  while (Date.now() < screenDeadline && !onPhoneScreen) {
+    const xml = await dumpUI();
+    const lower = xml.toLowerCase();
+
+    // ── Language selection screen ────────────────────────────────────────
+    if (xml.includes('Choose your language') || xml.includes('Welcome to WhatsApp')) {
+      log('MAIN', 'Language screen — tapping English');
+      // Tap "English" or "(device's language)" — whichever appears first
+      const tapped = await tapElement('English', xml) ||
+                     await tapElement("(device's language)", xml);
+      if (!tapped) {
+        // Fallback: tap center of screen (English is usually near top of list)
+        tap(540, 600);
       }
+      await sleep(2000);
+      // Look for a "Continue" or checkmark button after selecting language
+      const afterLang = await dumpUI();
+      for (const btn of ['Continue', 'CONTINUE', 'Next', 'OK', 'Done']) {
+        if (afterLang.includes(btn)) {
+          await tapElement(btn, afterLang);
+          await sleep(2000);
+          break;
+        }
+      }
+      continue;
     }
-    await logScreen('POST-AGREE');
+
+    // ── Terms / agree screen ─────────────────────────────────────────────
+    if (lower.includes('agree') || lower.includes('terms') || lower.includes('privacy')) {
+      log('MAIN', 'Agree screen — accepting terms');
+      for (const btn of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree']) {
+        if (xml.includes(btn)) {
+          await tapElement(btn, xml);
+          await sleep(4000);
+          break;
+        }
+      }
+      continue;
+    }
+
+    // ── Google Play / system dialogs ─────────────────────────────────────
+    if (xml.includes('Update') || xml.includes('Google Play')) {
+      log('MAIN', 'Google Play dialog — dismissing');
+      await tapElement('Skip', xml) || await tapElement('Not now', xml) ||
+      await tapElement('Cancel', xml) || await tapElement('No thanks', xml);
+      await sleep(2000);
+      continue;
+    }
+
+    // ── Phone number screen reached ──────────────────────────────────────
+    if (lower.includes('phone number') || lower.includes('country') ||
+        lower.includes('enter your phone') || lower.includes('your phone')) {
+      log('MAIN', 'Phone number screen reached');
+      onPhoneScreen = true;
+      break;
+    }
+
+    // ── Crash dialog ─────────────────────────────────────────────────────
+    if (xml.includes('keeps stopping')) {
+      log('MAIN', 'Crash dialog — dismissing');
+      await tapElement('Close app', xml);
+      await sleep(2000);
+      adbShell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1 2>/dev/null`);
+      await sleep(8000);
+      continue;
+    }
+
+    const visible = await screenTexts();
+    log('MAIN', `Waiting for agree/phone screen... visible: ${visible.slice(0,5).join(' | ')}`);
+    await sleep(3000);
+  }
+
+  if (!onPhoneScreen) {
+    await logScreen('ERROR');
+    await webhook('bad_number', { reason: 'Phone entry screen not reached after language/agree flow' });
+    process.exit(0);
   }
 
   // ── 6. Phone number entry ────────────────────────────────────────────────
+  log('MAIN', 'Waiting for phone number screen...');
+
+
   log('MAIN', 'Waiting for phone number screen...');
 
   // Poll for up to 90 seconds — WhatsApp can be slow on first launch
