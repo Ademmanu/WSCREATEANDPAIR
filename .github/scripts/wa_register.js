@@ -232,24 +232,26 @@ async function waitForAny(texts, timeoutMs = 60000) {
   return { xml: '', matched: null };
 }
 
-// Find element bounds by text, content-desc, or resource-id and tap it
+// Find element bounds by text or content-desc and tap it
+// Matches whole <node> first so bounds order doesn't matter
 async function tapElement(query, xml = null) {
   if (!xml) xml = await dumpUI();
-  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const patterns = [
-    new RegExp(`text="${escaped}"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`, 'i'),
-    new RegExp(`content-desc="${escaped}"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`, 'i'),
-    new RegExp(`resource-id="[^"]*${escaped}[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`, 'i'),
-  ];
-  for (const re of patterns) {
-    const m = xml.match(re);
-    if (m) {
-      const cx = Math.round((+m[1] + +m[3]) / 2);
-      const cy = Math.round((+m[2] + +m[4]) / 2);
-      log('TAP', `"${query}" → (${cx},${cy})`);
-      tap(cx, cy);
-      await sleep(800);
-      return true;
+  const escaped = query.replace(/[.+?^${}()|[\]\\]/g, '\$&');
+  const boundsRe = /bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/;
+
+  for (const attr of ['text', 'content-desc']) {
+    const nodeRe = new RegExp(`<node[^>]*${attr}="${escaped}"[^>]*/?>`, 'i');
+    const nodeMatch = xml.match(nodeRe);
+    if (nodeMatch) {
+      const bm = nodeMatch[0].match(boundsRe);
+      if (bm) {
+        const cx = Math.round((+bm[1] + +bm[3]) / 2);
+        const cy = Math.round((+bm[2] + +bm[4]) / 2);
+        log('TAP', `"${query}" → (${cx},${cy})`);
+        tap(cx, cy);
+        await sleep(800);
+        return true;
+      }
     }
   }
   log('TAP', `"${query}" bounds not found — skipping`);
@@ -257,17 +259,28 @@ async function tapElement(query, xml = null) {
 }
 
 // Tap element by exact resource-id
+// uiautomator XML has attributes in arbitrary order — bounds may appear
+// before OR after resource-id, so we extract the whole node first.
 async function tapById(resourceId, xml = null) {
   if (!xml) xml = await dumpUI();
-  const re = new RegExp(`resource-id="${resourceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`, 'i');
-  const m = xml.match(re);
-  if (m) {
-    const cx = Math.round((+m[1] + +m[3]) / 2);
-    const cy = Math.round((+m[2] + +m[4]) / 2);
-    log('TAP-ID', `"${resourceId}" → (${cx},${cy})`);
-    tap(cx, cy);
-    await sleep(800);
-    return true;
+  const escaped = resourceId.replace(/[.+?^${}()|[\]\\]/g, '\$&');
+
+  // Match the entire <node ...> element that contains this resource-id
+  // Capture everything between < and /> or >
+  const nodeRe = new RegExp(`<node[^>]*resource-id="${escaped}"[^>]*/?>`, 'i');
+  const nodeMatch = xml.match(nodeRe);
+  if (nodeMatch) {
+    const node = nodeMatch[0];
+    const boundsRe = /bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/;
+    const boundsMatch = node.match(boundsRe);
+    if (boundsMatch) {
+      const cx = Math.round((+boundsMatch[1] + +boundsMatch[3]) / 2);
+      const cy = Math.round((+boundsMatch[2] + +boundsMatch[4]) / 2);
+      log('TAP-ID', `"${resourceId}" → (${cx},${cy})`);
+      tap(cx, cy);
+      await sleep(800);
+      return true;
+    }
   }
   log('TAP-ID', `"${resourceId}" not found`);
   return false;
@@ -763,7 +776,7 @@ async function main() {
   log('MAIN', 'Tapping NEXT...');
   const nextScreenXml = await dumpUI();
   const nextTapped =
-    await tapById('com.whatsapp:id/registration_submit_phone_btn', nextScreenXml) ||
+    await tapById('com.whatsapp:id/registration_submit', nextScreenXml) ||
     await tapElement('NEXT', nextScreenXml) ||
     await tapElement('Next', nextScreenXml);
 
