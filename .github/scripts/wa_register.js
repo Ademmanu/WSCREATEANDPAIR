@@ -465,29 +465,50 @@ async function main() {
   }
 
 
-  // ── 5. Accept terms ──────────────────────────────────────────────────────
-  // Wait up to 30s for WhatsApp agree screen — also handle Google dialogs
+  // ── 5. Language screen → Accept terms ───────────────────────────────────
+  // Newer WhatsApp shows a language picker first. Bottom-left arrow navigates
+  // to the AGREE AND CONTINUE screen.
+  log('MAIN', 'Checking for language screen...');
+
+  const langXml = await dumpUI(6000);
+  if (langXml.includes('Choose your language') || langXml.includes('Welcome to WhatsApp')) {
+    log('MAIN', 'Language screen detected — tapping next arrow');
+
+    // The arrow is at bottom-left of Pixel 4 (1080x2280 screen)
+    // Approximate coords: x=108, y=2100 (bottom-left corner)
+    // Also try content-desc variants WhatsApp uses for the arrow
+    const arrowTapped =
+      await tapElement('next', langXml) ||
+      await tapElement('Next', langXml) ||
+      await tapElement('arrow', langXml) ||
+      await tapElement('Continue', langXml);
+
+    if (!arrowTapped) {
+      // Tap bottom-left arrow by coordinate
+      log('MAIN', 'Arrow not found by text — tapping bottom-left coordinate');
+      tap(108, 2100);
+    }
+    await sleep(3000);
+    await logScreen('POST-LANGUAGE');
+  }
+
+  // ── Accept terms ─────────────────────────────────────────────────────────
   const agreeResult = await waitForAny([
     'AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree',
-    // WhatsApp sometimes shows these first
     'Enter your phone number', 'Your phone number', 'Phone number', 'Country',
-    // Google Play dialogs that block WhatsApp
     'Update', 'Skip', 'Not now', 'Cancel',
   ], 30000);
 
   if (agreeResult.matched) {
     log('MAIN', `Screen shows: "${agreeResult.matched}"`);
-    // Dismiss Google Play / update dialogs first
     if (['Update', 'Skip', 'Not now', 'Cancel'].includes(agreeResult.matched)) {
       await tapElement('Skip', agreeResult.xml) ||
       await tapElement('Not now', agreeResult.xml) ||
       await tapElement('Cancel', agreeResult.xml);
       await sleep(3000);
-      // Now launch WhatsApp again
       adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
       await sleep(6000);
     }
-    // Tap agree if present
     const agreeXml = await dumpUI();
     for (const btn of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree']) {
       if (agreeXml.includes(btn)) {
@@ -500,6 +521,9 @@ async function main() {
   }
 
   // ── 6. Phone number entry ────────────────────────────────────────────────
+  log('MAIN', 'Waiting for phone number screen...');
+
+
   log('MAIN', 'Waiting for phone number screen...');
 
 
