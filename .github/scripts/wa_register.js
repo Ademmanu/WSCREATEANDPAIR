@@ -608,51 +608,85 @@ async function main() {
 
   await logScreen('AFTER-AGREE-DONE');
 
-  // ── Step 1: Edit country code field (clear "1", type cc) ─────────────────
-  log('MAIN', `Editing country code field → ${phoneInfo.countryCode}`);
+  // ── Step 1: Open country picker by tapping "United States" ──────────────
+  log('MAIN', `Opening country picker to select cc=${phoneInfo.countryCode} country=${phoneInfo.country}`);
 
-  // The country code field shows as "Country code for United States, plus 1"
-  // Tap the field that contains the current code number
   const ccXml = await dumpUI();
 
-  // Try tapping by content-desc containing "plus" or "Country code"
-  let ccTapped = false;
-  const ccPatterns = ['plus 1', 'Country code', 'country code', 'plus'];
-  for (const pat of ccPatterns) {
-    if (ccXml.includes(pat)) {
-      ccTapped = await tapElement(pat, ccXml);
-      if (ccTapped) break;
+  // Tap the country name — this opens the country search dialog
+  let pickerOpened = await tapElement('United States', ccXml);
+  if (!pickerOpened) {
+    // Try tapping the flag/country area by coordinate (left side of phone row)
+    log('MAIN', 'United States not found — tapping country selector coordinate (270, 711)');
+    tap(270, 711);
+  }
+  await sleep(2000);
+  await logScreen('POST-PICKER-OPEN');
+
+  // ── Step 2: Search for the country by dial code ───────────────────────────
+  log('MAIN', `Searching for country code +${phoneInfo.countryCode}`);
+
+  const pickerXml = await dumpUI();
+
+  // First check for a search icon (ImageButton/ImageView with content-desc "Search")
+  // then fall back to the text field
+  const searchIconTapped =
+    await tapElement('Search', pickerXml) ||
+    await tapElement('search', pickerXml) ||
+    await tapElement('Search countries', pickerXml) ||
+    await tapElement('Search…', pickerXml) ||
+    await tapElement('Search...', pickerXml);
+
+  if (!searchIconTapped) {
+    // Try tapping the magnifying glass icon by coordinate (top-right of picker)
+    log('MAIN', 'Search icon not found — tapping search icon coordinate (968, 184)');
+    tap(968, 184);
+    await sleep(800);
+    // Now the search field should be open — tap it
+    const afterIconXml = await dumpUI();
+    const fieldTapped =
+      await tapElement('Search', afterIconXml) ||
+      await tapElement('Search countries', afterIconXml);
+    if (!fieldTapped) {
+      log('MAIN', 'Search field still not found — tapping center-top (540, 300)');
+      tap(540, 300);
     }
   }
-  if (!ccTapped) {
-    // Fallback: the +code field is usually at approx x=175, y=700 on Pixel 4 API33
-    log('MAIN', 'CC field not found by text — tapping coordinate (175, 700)');
-    tap(175, 700);
-  }
-  await sleep(1000);
-
-  // Select all and delete existing code, then type new country code
-  keyevent('KEYCODE_CTRL_A');
-  await sleep(200);
-  keyevent('KEYCODE_DEL');
-  await sleep(200);
-  typeText(phoneInfo.countryCode);
   await sleep(800);
-  await logScreen('POST-CC-EDIT');
 
-  // ── Step 2: Enter national number in Phone number field ───────────────────
+  // Type the country dial code to filter the list
+  typeText(phoneInfo.countryCode);
+  await sleep(2000);
+  await logScreen('POST-SEARCH');
+
+  // ── Step 3: Select the correct country from the filtered list ─────────────
+  log('MAIN', `Selecting country: ${phoneInfo.country} (+${phoneInfo.countryCode})`);
+
+  const searchResultXml = await dumpUI();
+  // Try tapping by country code with + prefix, then by country name
+  const selected =
+    await tapElement(`+${phoneInfo.countryCode}`, searchResultXml) ||
+    await tapElement(phoneInfo.countryCode, searchResultXml);
+
+  if (!selected) {
+    // Tap the first result in the list (usually around y=500 after search header)
+    log('MAIN', 'Country not found by code — tapping first list result (540, 500)');
+    tap(540, 500);
+  }
+  await sleep(2000);
+  await logScreen('POST-COUNTRY-SELECTED');
+
+  // ── Step 4: Enter national number ─────────────────────────────────────────
   log('MAIN', `Entering national number → ${phoneInfo.nationalNumber}`);
 
   const numXml = await dumpUI();
   const numTapped = await tapElement('Phone number', numXml);
   if (!numTapped) {
-    // Fallback: phone number field is usually at approx x=650, y=700
-    log('MAIN', 'Phone number field not found by text — tapping coordinate (650, 700)');
-    tap(650, 700);
+    log('MAIN', 'Phone number field not found — tapping (649, 711)');
+    tap(649, 711);
   }
   await sleep(800);
 
-  // Clear and type national number
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
   keyevent('KEYCODE_DEL');
@@ -661,12 +695,12 @@ async function main() {
   await sleep(800);
   await logScreen('POST-NUMBER-ENTRY');
 
-  // ── Step 3: Tap NEXT ──────────────────────────────────────────────────────
+  // ── Step 5: Tap NEXT ──────────────────────────────────────────────────────
   log('MAIN', 'Tapping NEXT...');
   const nextXml = await dumpUI();
   const nextTapped = await tapElement('NEXT', nextXml) || await tapElement('Next', nextXml);
   if (!nextTapped) {
-    log('MAIN', 'NEXT not found by text — tapping coordinate (540, 2104)');
+    log('MAIN', 'NEXT not found — tapping (540, 2104)');
     tap(540, 2104);
   }
   await sleep(4000);
