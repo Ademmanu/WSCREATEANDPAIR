@@ -85,11 +85,12 @@ jobs:
           NODE_PORT: '3001'
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          # google_apis target includes ARM translation (libhoudini/libhoudini)
-          # which allows ARM APKs to run on x86_64 emulators.
-          # This is the same target used by official Android Studio emulators.
-          api-level: 29
-          target: google_apis
+          # google_apis_playstore includes Play Store which ships with an
+          # up-to-date Google Play Services — fixes "WhatsApp won't run unless
+          # you update Google Play services" block on plain google_apis images.
+          # api-level 30 (Android 11) has a more recent GPS pre-installed.
+          api-level: 30
+          target: google_apis_playstore
           arch: x86_64
           profile: pixel_4
           avd-name: wa_reg
