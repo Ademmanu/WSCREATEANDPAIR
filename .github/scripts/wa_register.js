@@ -523,15 +523,6 @@ async function main() {
   // ── 6. Phone number entry ────────────────────────────────────────────────
   log('MAIN', 'Waiting for phone number screen...');
 
-
-  log('MAIN', 'Waiting for phone number screen...');
-
-
-  log('MAIN', 'Waiting for phone number screen...');
-
-
-  log('MAIN', 'Waiting for phone number screen...');
-
   // Poll for up to 90 seconds — WhatsApp can be slow on first launch
   let phoneResult = { matched: null, xml: '' };
   const phoneDeadline = Date.now() + 90000;
