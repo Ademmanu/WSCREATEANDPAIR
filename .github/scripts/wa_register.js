@@ -490,6 +490,32 @@ async function main() {
     }
     await sleep(3000);
     await logScreen('POST-LANGUAGE');
+
+    // Dismiss any alert dialog that appears after language selection
+    // (e.g. "App out of date", "Update required", Google Play Services alert)
+    const alertXml = await dumpUI(4000);
+    if (alertXml.includes('Alert') || alertXml.includes('alert') ||
+        alertXml.includes('Update') || alertXml.includes('out of date') ||
+        alertXml.includes('More info')) {
+      log('MAIN', 'Alert dialog after language — checking content...');
+      // Log full alert text for debugging
+      const alertTexts = [];
+      const re = /text="([^"]{2,120})"/g;
+      let m;
+      while ((m = re.exec(alertXml)) !== null) alertTexts.push(m[1]);
+      log('ALERT', alertTexts.join(' | '));
+
+      // If it says update required / out of date — this APK version is too old
+      const alertLower = alertXml.toLowerCase();
+      if (alertLower.includes('update') || alertLower.includes('out of date') ||
+          alertLower.includes('expired') || alertLower.includes('no longer')) {
+        log('MAIN', 'WhatsApp version too old — tapping OK and attempting to continue anyway');
+      }
+      // Tap OK to dismiss regardless
+      await tapElement('OK', alertXml) || tap(540, 1100);
+      await sleep(3000);
+      await logScreen('POST-ALERT');
+    }
   }
 
   // ── Accept terms ─────────────────────────────────────────────────────────
