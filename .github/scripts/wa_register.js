@@ -232,26 +232,61 @@ async function waitForAny(texts, timeoutMs = 60000) {
   return { xml: '', matched: null };
 }
 
-// Find element bounds by text and tap it
-async function tapElement(text, xml = null) {
+// Find element bounds by text, content-desc, or resource-id and tap it
+async function tapElement(query, xml = null) {
   if (!xml) xml = await dumpUI();
-  const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const patterns = [
-    new RegExp(`text="${escaped}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`, 'i'),
-    new RegExp(`content-desc="${escaped}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`, 'i'),
+    new RegExp(`text="${escaped}"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`, 'i'),
+    new RegExp(`content-desc="${escaped}"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`, 'i'),
+    new RegExp(`resource-id="[^"]*${escaped}[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`, 'i'),
   ];
   for (const re of patterns) {
     const m = xml.match(re);
     if (m) {
       const cx = Math.round((+m[1] + +m[3]) / 2);
       const cy = Math.round((+m[2] + +m[4]) / 2);
-      log('TAP', `"${text}" → (${cx},${cy})`);
+      log('TAP', `"${query}" → (${cx},${cy})`);
       tap(cx, cy);
       await sleep(800);
       return true;
     }
   }
-  log('TAP', `"${text}" bounds not found — skipping`);
+  log('TAP', `"${query}" bounds not found — skipping`);
+  return false;
+}
+
+// Tap element by exact resource-id
+async function tapById(resourceId, xml = null) {
+  if (!xml) xml = await dumpUI();
+  const re = new RegExp(`resource-id="${resourceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`, 'i');
+  const m = xml.match(re);
+  if (m) {
+    const cx = Math.round((+m[1] + +m[3]) / 2);
+    const cy = Math.round((+m[2] + +m[4]) / 2);
+    log('TAP-ID', `"${resourceId}" → (${cx},${cy})`);
+    tap(cx, cy);
+    await sleep(800);
+    return true;
+  }
+  log('TAP-ID', `"${resourceId}" not found`);
+  return false;
+}
+
+// Type text into a field identified by resource-id
+async function typeIntoId(resourceId, text, xml = null) {
+  if (!xml) xml = await dumpUI();
+  const tapped = await tapById(resourceId, xml);
+  if (tapped) {
+    await sleep(500);
+    keyevent('KEYCODE_CTRL_A');
+    await sleep(200);
+    keyevent('KEYCODE_DEL');
+    await sleep(200);
+    typeText(text);
+    await sleep(600);
+    return true;
+  }
   return false;
 }
 
@@ -608,97 +643,117 @@ async function main() {
 
   await logScreen('AFTER-AGREE-DONE');
 
-  // ── Step 1: Open country picker by tapping "United States" ──────────────
-  log('MAIN', `Opening country picker to select cc=${phoneInfo.countryCode} country=${phoneInfo.country}`);
+  // ── Phone number entry using WhatsApp resource IDs ───────────────────────
+  // WhatsApp's registration screen has stable resource IDs:
+  //   com.whatsapp:id/registration_cc       — country code selector button
+  //   com.whatsapp:id/registration_phone    — national number input field
+  //   com.whatsapp:id/registration_submit_phone_btn — NEXT button
+  //
+  // The country picker dialog has:
+  //   com.whatsapp:id/search              — search icon/field in picker
+  //   com.whatsapp:id/search_src_text     — actual search EditText
+  //   com.whatsapp:id/registration_code   — list items showing dial codes
 
-  const ccXml = await dumpUI();
+  const phoneScreenXml = await dumpUI();
 
-  // Tap the country name — this opens the country search dialog
-  let pickerOpened = await tapElement('United States', ccXml);
-  if (!pickerOpened) {
-    // Try tapping the flag/country area by coordinate (left side of phone row)
-    log('MAIN', 'United States not found — tapping country selector coordinate (270, 711)');
-    tap(270, 711);
-  }
-  await sleep(2000);
+  // Log all resource-ids on screen for debugging
+  const ids = [...phoneScreenXml.matchAll(/resource-id="([^"]+)"/g)].map(m => m[1]);
+  log('RESOURCE-IDS', [...new Set(ids)].join(' | '));
+
+  // ── Step 1: Tap country code selector ────────────────────────────────────
+  log('MAIN', `Selecting country cc=${phoneInfo.countryCode} (${phoneInfo.country})`);
+
+  const ccOpened =
+    await tapById('com.whatsapp:id/registration_cc', phoneScreenXml) ||
+    await tapById('com.whatsapp:id/flag_button', phoneScreenXml) ||
+    await tapElement('United States', phoneScreenXml);
+
+  await sleep(2500);
   await logScreen('POST-PICKER-OPEN');
 
-  // ── Step 2: Search for the country by dial code ───────────────────────────
-  log('MAIN', `Searching for country code +${phoneInfo.countryCode}`);
-
   const pickerXml = await dumpUI();
+  const pickerIds = [...pickerXml.matchAll(/resource-id="([^"]+)"/g)].map(m => m[1]);
+  log('PICKER-IDS', [...new Set(pickerIds)].join(' | '));
 
-  // First check for a search icon (ImageButton/ImageView with content-desc "Search")
-  // then fall back to the text field
-  const searchIconTapped =
-    await tapElement('Search', pickerXml) ||
-    await tapElement('search', pickerXml) ||
-    await tapElement('Search countries', pickerXml) ||
-    await tapElement('Search…', pickerXml) ||
-    await tapElement('Search...', pickerXml);
+  // ── Step 2: Open search in picker ────────────────────────────────────────
+  log('MAIN', 'Opening search in country picker...');
 
-  if (!searchIconTapped) {
-    // Try tapping the magnifying glass icon by coordinate (top-right of picker)
-    log('MAIN', 'Search icon not found — tapping search icon coordinate (968, 184)');
+  const searchOpened =
+    await tapById('com.whatsapp:id/search', pickerXml) ||
+    await tapById('com.whatsapp:id/menu_search', pickerXml) ||
+    await tapById('com.whatsapp:id/search_src_text', pickerXml) ||
+    await tapElement('Search', pickerXml);
+
+  if (!searchOpened) {
+    log('MAIN', 'Search not found — tapping top-right area (968, 184)');
     tap(968, 184);
-    await sleep(800);
-    // Now the search field should be open — tap it
-    const afterIconXml = await dumpUI();
-    const fieldTapped =
-      await tapElement('Search', afterIconXml) ||
-      await tapElement('Search countries', afterIconXml);
-    if (!fieldTapped) {
-      log('MAIN', 'Search field still not found — tapping center-top (540, 300)');
-      tap(540, 300);
-    }
   }
-  await sleep(800);
+  await sleep(1500);
+  await logScreen('POST-SEARCH-OPEN');
 
-  // Type the country dial code to filter the list
-  typeText(phoneInfo.countryCode);
-  await sleep(2000);
-  await logScreen('POST-SEARCH');
+  // ── Step 3: Type country code in search ───────────────────────────────────
+  log('MAIN', `Typing country code: ${phoneInfo.countryCode}`);
 
-  // ── Step 3: Select the correct country from the filtered list ─────────────
-  log('MAIN', `Selecting country: ${phoneInfo.country} (+${phoneInfo.countryCode})`);
+  const searchXml = await dumpUI();
+  const typedInSearch =
+    await typeIntoId('com.whatsapp:id/search_src_text', phoneInfo.countryCode, searchXml) ||
+    await typeIntoId('com.whatsapp:id/search', phoneInfo.countryCode, searchXml);
 
-  const searchResultXml = await dumpUI();
-  // Try tapping by country code with + prefix, then by country name
-  const selected =
-    await tapElement(`+${phoneInfo.countryCode}`, searchResultXml) ||
-    await tapElement(phoneInfo.countryCode, searchResultXml);
-
-  if (!selected) {
-    // Tap the first result in the list (usually around y=500 after search header)
-    log('MAIN', 'Country not found by code — tapping first list result (540, 500)');
-    tap(540, 500);
+  if (!typedInSearch) {
+    typeText(phoneInfo.countryCode);
   }
   await sleep(2000);
-  await logScreen('POST-COUNTRY-SELECTED');
+  await logScreen('POST-SEARCH-TYPED');
 
-  // ── Step 4: Enter national number ─────────────────────────────────────────
-  log('MAIN', `Entering national number → ${phoneInfo.nationalNumber}`);
+  // ── Step 4: Select country from results ───────────────────────────────────
+  log('MAIN', `Selecting country from results...`);
 
-  const numXml = await dumpUI();
-  const numTapped = await tapElement('Phone number', numXml);
-  if (!numTapped) {
-    log('MAIN', 'Phone number field not found — tapping (649, 711)');
+  const resultsXml = await dumpUI();
+  const resultIds = [...resultsXml.matchAll(/resource-id="([^"]+)"/g)].map(m => m[1]);
+  log('RESULTS-IDS', [...new Set(resultIds)].join(' | '));
+
+  // Try tapping the first result item by resource-id
+  const picked =
+    await tapById('com.whatsapp:id/registration_code', resultsXml) ||
+    await tapElement(`+${phoneInfo.countryCode}`, resultsXml) ||
+    await tapElement(phoneInfo.countryCode, resultsXml);
+
+  if (!picked) {
+    log('MAIN', 'Tapping first result at (540, 450)');
+    tap(540, 450);
+  }
+  await sleep(2000);
+  await logScreen('POST-COUNTRY-PICKED');
+
+  // ── Step 5: Enter national number ─────────────────────────────────────────
+  log('MAIN', `Entering national number: ${phoneInfo.nationalNumber}`);
+
+  const numScreenXml = await dumpUI();
+  const numTyped =
+    await typeIntoId('com.whatsapp:id/registration_phone', phoneInfo.nationalNumber, numScreenXml) ||
+    await typeIntoId('com.whatsapp:id/phone_number', phoneInfo.nationalNumber, numScreenXml);
+
+  if (!numTyped) {
+    log('MAIN', 'Phone field not found by id — tapping (649,711)');
     tap(649, 711);
+    await sleep(500);
+    keyevent('KEYCODE_CTRL_A');
+    await sleep(200);
+    keyevent('KEYCODE_DEL');
+    await sleep(200);
+    typeText(phoneInfo.nationalNumber);
   }
-  await sleep(800);
+  await sleep(1000);
+  await logScreen('POST-NUMBER-TYPED');
 
-  keyevent('KEYCODE_CTRL_A');
-  await sleep(200);
-  keyevent('KEYCODE_DEL');
-  await sleep(200);
-  typeText(phoneInfo.nationalNumber);
-  await sleep(800);
-  await logScreen('POST-NUMBER-ENTRY');
-
-  // ── Step 5: Tap NEXT ──────────────────────────────────────────────────────
+  // ── Step 6: Tap NEXT ──────────────────────────────────────────────────────
   log('MAIN', 'Tapping NEXT...');
-  const nextXml = await dumpUI();
-  const nextTapped = await tapElement('NEXT', nextXml) || await tapElement('Next', nextXml);
+  const nextScreenXml = await dumpUI();
+  const nextTapped =
+    await tapById('com.whatsapp:id/registration_submit_phone_btn', nextScreenXml) ||
+    await tapElement('NEXT', nextScreenXml) ||
+    await tapElement('Next', nextScreenXml);
+
   if (!nextTapped) {
     log('MAIN', 'NEXT not found — tapping (540, 2104)');
     tap(540, 2104);
