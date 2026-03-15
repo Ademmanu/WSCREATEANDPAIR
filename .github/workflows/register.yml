@@ -85,11 +85,10 @@ jobs:
           NODE_PORT: '3001'
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          # google_apis_playstore includes Play Store which ships with an
-          # up-to-date Google Play Services — fixes "WhatsApp won't run unless
-          # you update Google Play services" block on plain google_apis images.
-          # api-level 30 (Android 11) has a more recent GPS pre-installed.
-          api-level: 30
+          # API 33 google_apis_playstore ships with GPS 22.x+ which satisfies
+          # WhatsApp's minimum GPS requirement. Lower API levels ship GPS 20.x
+          # which WhatsApp hard-blocks since 2023.
+          api-level: 33
           target: google_apis_playstore
           arch: x86_64
           profile: pixel_4
@@ -100,7 +99,7 @@ jobs:
             -no-snapshot
             -noaudio
             -no-boot-anim
-            -memory 3072
+            -memory 4096
             -cores 2
           # Disable lock screen at AVD level before boot
           pre-emulator-launch-script: |
