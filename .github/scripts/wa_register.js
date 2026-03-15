@@ -314,40 +314,58 @@ async function installWhatsApp() {
   // ADB needs a moment after boot
   await sleep(2000);
 
-  const strategies = [
-    `adb install -r -t -g ${APK_PATH}`,
-    `adb install -r -t -g --abi x86_64 ${APK_PATH}`,
-    `adb install -r -t -g --abi x86 ${APK_PATH}`,
-  ];
+  // Strategy 1: push to device then install via pm — faster than adb install for large APKs
+  // adb push streams at full speed, pm install is local on-device (no ADB overhead)
+  log('INSTALL', 'Pushing APK to device...');
+  const pushOut = runScript(`adb push ${APK_PATH} /data/local/tmp/whatsapp.apk 2>&1`, 600000);
+  log('INSTALL', `Push output: ${pushOut}`);
 
-  for (const [i, cmd] of strategies.entries()) {
-    log('INSTALL', `Attempt ${i + 1}: ${cmd}`);
-    const out = runScript(`${cmd} 2>&1`, 300000);
-    log('INSTALL', `Output: ${out}`);
-
-    if (out.toLowerCase().includes('success')) {
-      log('INSTALL', 'Success');
-      return;
+  if (pushOut.toLowerCase().includes('error') && !pushOut.includes('pushed')) {
+    log('INSTALL', 'Push failed — falling back to adb install...');
+    const directOut = runScript(`adb install -r -t -g ${APK_PATH} 2>&1`, 600000);
+    log('INSTALL', `Direct install output: ${directOut}`);
+    if (!directOut.toLowerCase().includes('success') && !directOut.includes('pushed')) {
+      throw new Error(`Install failed: ${directOut}`);
     }
+  } else {
+    // Install from the on-device copy
+    log('INSTALL', 'Installing from on-device copy...');
+    const pmOut = runScript('adb shell pm install -r -t -g /data/local/tmp/whatsapp.apk 2>&1', 120000);
+    log('INSTALL', `pm install output: ${pmOut}`);
 
-    if (out.includes('INSTALL_FAILED_NO_MATCHING_ABIS') && i === strategies.length - 1) {
-      throw new Error('APK has no compatible native libs for this emulator. Upload the x86 or universal variant.');
-    }
-
-    if (out.includes('INSTALL_FAILED') && !out.includes('INSTALL_FAILED_NO_MATCHING_ABIS')) {
-      throw new Error(`Install failed: ${out}`);
+    if (!pmOut.toLowerCase().includes('success')) {
+      // Fallback: try adb install directly
+      log('INSTALL', 'pm install failed — trying adb install directly...');
+      const fallbackOut = runScript(`adb install -r -t -g ${APK_PATH} 2>&1`, 600000);
+      log('INSTALL', `Fallback output: ${fallbackOut}`);
+      if (!fallbackOut.toLowerCase().includes('success')) {
+        // Last check via pm list
+        await sleep(3000);
+        const pkgList = runScript('adb shell pm list packages 2>/dev/null', 10000);
+        if (!pkgList.includes('com.whatsapp')) {
+          throw new Error(`Install failed. pm: ${pmOut} | adb: ${fallbackOut}`);
+        }
+      }
     }
   }
 
-  // Final fallback — check pm list in case install succeeded without printing "Success"
-  await sleep(3000);
-  const installed = runScript('adb shell pm list packages 2>/dev/null | grep com.whatsapp', 10000);
-  if (installed.includes('com.whatsapp')) {
-    log('INSTALL', 'Verified via pm list');
+  // Verify installation
+  await sleep(2000);
+  const pkgList = runScript('adb shell pm list packages 2>/dev/null', 10000);
+  if (pkgList.includes('com.whatsapp')) {
+    log('INSTALL', 'Verified via pm list — installed');
     return;
   }
 
-  throw new Error('WhatsApp failed to install after all attempts');
+  // One final check — sometimes pm list is slow to update
+  await sleep(5000);
+  const pkgList2 = runScript('adb shell pm list packages 2>/dev/null', 10000);
+  if (pkgList2.includes('com.whatsapp')) {
+    log('INSTALL', 'Verified via pm list (delayed) — installed');
+    return;
+  }
+
+  throw new Error('WhatsApp package not found after install');
 }
 
 // ── Screen unlock ─────────────────────────────────────────────────────────────
@@ -420,20 +438,54 @@ async function main() {
   await sleep(8000);
   await logScreen('LAUNCH');
 
-  // If still on home screen, force-stop and relaunch
+  // Check what happened after launch
   const launchTexts = await screenTexts();
   const onHomeScreen = launchTexts.some(t =>
-    t.includes('Messages') || t.includes('Chrome') || t.includes('Sunday') ||
-    t.includes('Monday') || t.includes('Tuesday') || t.includes('Wednesday') ||
-    t.includes('Thursday') || t.includes('Friday') || t.includes('Saturday')
+    t.includes('Messages') || t.includes('Chrome') ||
+    ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday']
+      .some(d => t.includes(d))
   );
+  const isCrashing = launchTexts.some(t => t.includes('keeps stopping'));
 
-  if (onHomeScreen) {
-    log('MAIN', 'Still on home screen — force-stopping and retrying...');
-    adbShell(`am force-stop ${WA_PACKAGE}`);
+  // Capture logcat immediately to see what WhatsApp is doing
+  const logcat = adbShell('logcat -d -t 80 *:E 2>/dev/null | tail -40');
+  log('LOGCAT', logcat || '(empty)');
+
+  if (isCrashing) {
+    // Dismiss crash dialog
+    log('MAIN', 'Crash dialog detected — dismissing and checking logcat...');
+    const crashXml = await dumpUI();
+    await tapElement('Close app', crashXml);
     await sleep(2000);
+
+    // Check if a specific error is visible
+    const errorXml = await dumpUI();
+    log('CRASH-SCREEN', errorXml.substring(0, 500));
+
+    // Try clearing app data and relaunching fresh
+    log('MAIN', 'Clearing WhatsApp data and relaunching...');
+    adbShell(`pm clear ${WA_PACKAGE} 2>/dev/null || true`);
+    await sleep(2000);
+
+    // Re-grant permissions after clear
+    for (const perm of [
+      'android.permission.READ_CONTACTS','android.permission.WRITE_CONTACTS',
+      'android.permission.READ_PHONE_STATE','android.permission.RECEIVE_SMS',
+      'android.permission.READ_SMS','android.permission.SEND_SMS',
+      'android.permission.CAMERA','android.permission.RECORD_AUDIO',
+      'android.permission.READ_EXTERNAL_STORAGE','android.permission.WRITE_EXTERNAL_STORAGE',
+    ]) {
+      adbShell(`pm grant ${WA_PACKAGE} ${perm} 2>/dev/null || true`);
+    }
+
     adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
     await sleep(10000);
+    await logScreen('RELAUNCH');
+
+  } else if (onHomeScreen) {
+    // WhatsApp started but didn't come to foreground — just wait longer
+    log('MAIN', 'WhatsApp on home screen — waiting longer for it to surface...');
+    await sleep(8000);
     await logScreen('RELAUNCH');
   }
 
@@ -492,11 +544,26 @@ async function main() {
     if (!phoneResult.matched) {
       const visible = await screenTexts();
       log('MAIN', `Still waiting for phone screen... visible: ${visible.slice(0, 5).join(' | ')}`);
-      // Tap agree again in case it re-appeared
+
+      // Dismiss crash dialog if it reappears
+      if (xml.includes('keeps stopping')) {
+        log('MAIN', 'Crash dialog reappeared — dismissing...');
+        await tapElement('Close app', xml);
+        await sleep(2000);
+        adbShell(`pm clear ${WA_PACKAGE} 2>/dev/null || true`);
+        await sleep(1000);
+        adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
+        await sleep(8000);
+        continue;
+      }
+
+      // Tap agree in case it re-appeared
       if (xml.includes('AGREE') || xml.includes('Agree')) {
         await tapElement('AGREE AND CONTINUE', xml) || await tapElement('Agree and continue', xml);
         await sleep(3000);
+        continue;
       }
+
       await sleep(3000);
     }
   }
