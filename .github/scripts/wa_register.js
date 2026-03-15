@@ -605,9 +605,249 @@ async function main() {
     await logScreen('POST-AGREE');
   }
 
-  // ── Done for now — step by step ─────────────────────────────────────────
+
+  // ── 6. Enter phone number ─────────────────────────────────────────────
   await logScreen('AFTER-AGREE-DONE');
-  log('MAIN', 'Stopping here — step by step mode');
+  await sleep(2000);
+
+  // Find and tap phone number input field
+  let phoneInputXml = await dumpUI();
+  const phoneFieldTapped = 
+    await tapElement('Phone number', phoneInputXml) ||
+    await tapElement(`+${phoneInfo.countryCode}`, phoneInputXml) ||
+    await tapElement('Enter your phone number', phoneInputXml);
+
+  if (!phoneFieldTapped) {
+    log('MAIN', 'Phone field not found by text — using fallback tap');
+    tap(650, 1200);
+  }
+  await sleep(1000);
+
+  // Type the national number (without country code)
+  log('MAIN', `Entering phone number: ${phoneInfo.nationalNumber}`);
+  typeText(phoneInfo.nationalNumber);
+  await sleep(2000);
+  await logScreen('AFTER-NUMBER-ENTRY');
+
+  // ── 7. Tap NEXT to request OTP ─────────────────────────────────────────
+  const nextXml = await dumpUI();
+  const nextTapped = 
+    await tapElement('NEXT', nextXml) ||
+    await tapElement('Next', nextXml);
+
+  if (!nextTapped) {
+    log('MAIN', 'NEXT button not found — trying fallback tap');
+    tap(540, 1950);
+  }
+  await sleep(3000);
+
+  // Handle "Is this OK?" confirmation
+  const confirmXml = await dumpUI();
+  const confirmTexts = await screenTexts();
+  if (confirmTexts.some(t => t.includes('Is this OK?') || t.includes('correct'))) {
+    log('MAIN', 'Confirming phone number');
+    await tapElement('OK', confirmXml) || 
+    await tapElement('Yes', confirmXml) ||
+    tap(540, 1450);
+    await sleep(3000);
+  }
+
+  // ── 8. Wait for OTP request screen ─────────────────────────────────────
+  const otpScreenResult = await waitForAny([
+    'Verifying',
+    'Enter 6-digit code',
+    'waiting to automatically detect',
+    'Didn\'t get the code?',
+    'Call me',
+  ], 60000);
+
+  if (!otpScreenResult.matched) {
+    const errorTexts = await screenTexts();
+    if (errorTexts.some(t => t.includes('already registered') || t.includes('already in use'))) {
+      await webhook('bad_number', { reason: 'Phone number already registered' });
+      throw new Error('Number already registered');
+    }
+    if (errorTexts.some(t => t.includes('Too many') || t.includes('try again later'))) {
+      await webhook('rate_limited', { reason: 'Rate limited by WhatsApp' });
+      throw new Error('Rate limited');
+    }
+    if (errorTexts.some(t => t.includes('invalid') || t.includes('not valid'))) {
+      await webhook('bad_number', { reason: 'Invalid phone number' });
+      throw new Error('Invalid number');
+    }
+    throw new Error('OTP screen did not appear after 60s');
+  }
+
+  log('MAIN', `OTP screen detected: "${otpScreenResult.matched}"`);
+  await logScreen('OTP-SCREEN');
+
+  await webhook('awaiting_otp', {
+    message: `OTP requested for ${PHONE}`,
+  });
+
+  // ── 9. Poll for OTP from bot ───────────────────────────────────────────
+  log('MAIN', 'Polling for OTP from bot...');
+
+  const OTP_TIMEOUT = 15 * 60 * 1000;
+  const otpDeadline = Date.now() + OTP_TIMEOUT;
+  let otp = null;
+
+  while (Date.now() < otpDeadline && !otp) {
+    try {
+      const url = `${RENDER_BASE}/internal/get-otp/${encodeURIComponent(PHONE)}`;
+      
+      await new Promise((resolve) => {
+        const client = url.startsWith('https') ? https : http;
+        const req = client.get(url, {
+          headers: { 
+            'X-API-Key': WEBHOOK_SECRET,
+            'Content-Type': 'application/json',
+          },
+          timeout: 5000,
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.otp) {
+                otp = parsed.otp;
+                log('MAIN', `Received OTP: ${otp}`);
+              }
+            } catch (e) {}
+            resolve();
+          });
+        });
+        req.on('error', () => resolve());
+        req.on('timeout', () => { req.destroy(); resolve(); });
+      });
+    } catch (e) {
+      log('POLL', `OTP check failed: ${e.message}`);
+    }
+
+    if (!otp) await sleep(3000);
+  }
+
+  if (!otp) {
+    await webhook('timeout', { reason: 'OTP timeout' });
+    throw new Error('OTP timeout');
+  }
+
+  // ── 10. Submit OTP ─────────────────────────────────────────────────────
+  log('MAIN', `Submitting OTP: ${otp}`);
+
+  const otpInputXml = await dumpUI();
+  const singleFieldTapped = await tapElement('Enter 6-digit code', otpInputXml) ||
+                            await tapElement('6-digit code', otpInputXml);
+  
+  if (singleFieldTapped) {
+    await sleep(500);
+    typeDigits(otp);
+  } else {
+    log('MAIN', 'Using multi-box OTP input');
+    tap(200, 1200);
+    await sleep(500);
+    typeDigits(otp);
+  }
+
+  await sleep(8000);
+
+  // ── 11. Check for errors ───────────────────────────────────────────────
+  const afterOtpTexts = await screenTexts();
+  
+  if (afterOtpTexts.some(t => t.includes('wrong') || t.includes('incorrect') || t.includes('Invalid'))) {
+    log('MAIN', 'OTP verification failed');
+    await webhook('error_code', { reason: 'Wrong OTP code' });
+    throw new Error('OTP verification failed');
+  }
+
+  // ── 12. Wait for success screen ────────────────────────────────────────
+  const profileResult = await waitForAny([
+    'Profile info',
+    'Enter your name',
+    'SKIP',
+    'Chats',
+    'Restore',
+  ], 90000);
+
+  if (!profileResult.matched) {
+    const currentTexts = await screenTexts();
+    if (currentTexts.some(t => t.includes('Chats') || t.includes('Status'))) {
+      log('MAIN', 'Already on main screen');
+    } else {
+      throw new Error('Profile screen did not appear');
+    }
+  } else {
+    log('MAIN', `Success screen: "${profileResult.matched}"`);
+  }
+
+  // Skip profile setup
+  const skipXml = await dumpUI();
+  if (skipXml.includes('SKIP') || skipXml.includes('Skip')) {
+    log('MAIN', 'Skipping profile setup');
+    await tapElement('SKIP', skipXml) || await tapElement('Skip', skipXml);
+    await sleep(3000);
+  }
+
+  // Skip backup restore
+  const restoreXml = await dumpUI();
+  if (restoreXml.includes('Restore')) {
+    log('MAIN', 'Skipping backup restore');
+    await tapElement('SKIP', restoreXml) || tap(540, 1950);
+    await sleep(3000);
+  }
+
+  await logScreen('FINAL-SCREEN');
+
+  // ── 13. Extract session data ───────────────────────────────────────────
+  log('MAIN', 'Extracting session data...');
+
+  const sessionData = {
+    phone_number: PHONE,
+    registered_at: new Date().toISOString(),
+  };
+
+  try {
+    const keyFile = adbShell('cat /data/data/com.whatsapp/files/key 2>/dev/null');
+    if (keyFile && keyFile.length > 0) {
+      sessionData.encryption_key = Buffer.from(keyFile).toString('base64');
+      log('SESSION', 'Encryption key extracted');
+    }
+  } catch (e) {
+    log('SESSION', `Could not read key: ${e.message}`);
+  }
+
+  try {
+    const prefs = adbShell('cat /data/data/com.whatsapp/shared_prefs/com.whatsapp_preferences.xml 2>/dev/null');
+    if (prefs && prefs.includes('<?xml')) {
+      sessionData.preferences = prefs;
+      log('SESSION', 'Preferences extracted');
+    }
+  } catch (e) {
+    log('SESSION', `Could not read prefs: ${e.message}`);
+  }
+
+  try {
+    adb('pull /data/data/com.whatsapp/databases/msgstore.db.crypt14 /tmp/msgstore.db 2>&1');
+    if (fs.existsSync('/tmp/msgstore.db')) {
+      const dbContent = fs.readFileSync('/tmp/msgstore.db');
+      sessionData.database = dbContent.toString('base64');
+      log('SESSION', 'Database extracted');
+    }
+  } catch (e) {
+    log('SESSION', `Could not pull database: ${e.message}`);
+  }
+
+  log('MAIN', `Session extracted: ${Object.keys(sessionData).join(', ')}`);
+
+  // ── 14. Send success webhook ───────────────────────────────────────────
+  await webhook('success', {
+    session: sessionData,
+    phone_number: PHONE,
+    registered_at: sessionData.registered_at,
+  });
+
+  log('MAIN', `✅ Registration completed for ${PHONE}`);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
