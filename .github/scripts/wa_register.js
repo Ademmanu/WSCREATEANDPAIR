@@ -547,6 +547,13 @@ async function main() {
       }
     }
     await logScreen('POST-AGREE');
+
+    // Tap country selector to open country list
+    log('MAIN', 'Tapping country selector (United States)...');
+    const postAgreeXml = await dumpUI();
+    await tapElement('United States', postAgreeXml);
+    await sleep(3000);
+    await logScreen('AFTER-COUNTRY-TAP');
   }
 
   // ── 6. Phone number entry ────────────────────────────────────────────────
