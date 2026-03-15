@@ -232,79 +232,384 @@ async function installWhatsApp() {
   const size = fs.statSync(apkPath).size;
   console.log(`[SETUP] Installing WhatsApp APK (${(size / 1024 / 1024).toFixed(1)} MB)...`);
 
-  // Show APK architecture
-  fs.writeFileSync('/tmp/check_apk.sh', 'unzip -l /tmp/whatsapp.apk 2>/dev/null | grep lib/ | cut -d/ -f1-3 | sort -u\n');
-  const libFolders = run('sh /tmp/check_apk.sh', 10000);
-  console.log(`[SETUP] APK native libs:\n${libFolders || '(none — pure Java APK)'}`);
-
   await WAIT_MS(3000);
 
-  // Try multiple install strategies
+  // First check APK architecture to understand what we are installing
+  fs.writeFileSync('/tmp/check_apk.sh', 'unzip -l /tmp/whatsapp.apk 2>/dev/null | grep "lib/" | cut -d/ -f1-3 | sort -u\n');
+  const libFolders = run('sh /tmp/check_apk.sh', 10000);
+  console.log(`[SETUP] APK native libs: ${libFolders || '(none — may be pure Java APK)'}`);
+  console.log(`[SETUP] APK native libs: ${libFolders || '(none found — may be pure Java APK)'}`);
+
   let installed = false;
-
-  // Strategy 1: Standard install
-  console.log('[SETUP] Strategy 1: standard install...');
-  let result = run('adb install -r -t -g /tmp/whatsapp.apk 2>&1', 300000);
-  console.log(`[SETUP] Output: ${result}`);
-  if (result.toLowerCase().includes('success')) {
-    installed = true;
-  }
-
-  // Strategy 2: Force x86_64 ABI
-  if (!installed) {
-    console.log('[SETUP] Strategy 2: force x86_64 ABI...');
-    result = run('adb install -r -t -g --abi x86_64 /tmp/whatsapp.apk 2>&1', 300000);
-    console.log(`[SETUP] Output: ${result}`);
-    if (result.toLowerCase().includes('success')) installed = true;
-  }
-
-  // Strategy 3: Force x86 ABI
-  if (!installed) {
-    console.log('[SETUP] Strategy 3: force x86 ABI...');
-    result = run('adb install -r -t -g --abi x86 /tmp/whatsapp.apk 2>&1', 300000);
-    console.log(`[SETUP] Output: ${result}`);
-    if (result.toLowerCase().includes('success')) installed = true;
-  }
-
-  // Strategy 4: Repackage — strip ARM libs, keep only x86/x86_64
-  if (!installed && result.includes('INSTALL_FAILED_NO_MATCHING_ABIS')) {
-    console.log('[SETUP] Strategy 4: repackaging APK to remove ARM libs...');
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const script = 'set -e\n'
-        + 'cd /tmp && rm -rf apk_work && mkdir apk_work && cd apk_work\n'
-        + 'unzip -q /tmp/whatsapp.apk -d .\n'
-        + 'rm -rf lib/arm64-v8a lib/armeabi-v7a lib/armeabi 2>/dev/null || true\n'
-        + 'if [ -d lib/x86_64 ]; then rm -rf lib/x86 2>/dev/null || true; fi\n'
-        + 'ls lib/ 2>/dev/null || echo "no lib folder"\n'
-        + 'zip -q -r /tmp/whatsapp_x86.apk . -x "META-INF/*"\n'
-        + 'cd /tmp && rm -rf apk_work\n';
-      fs.writeFileSync('/tmp/repack.sh', script);
-      const repackOut = run('sh /tmp/repack.sh 2>&1', 120000);
-      console.log(`[SETUP] Repack output: ${repackOut}`);
-      if (fs.existsSync('/tmp/whatsapp_x86.apk')) {
-        result = run('adb install -r -t -g /tmp/whatsapp_x86.apk 2>&1', 300000);
-        console.log(`[SETUP] Repack install output: ${result}`);
-        if (result.toLowerCase().includes('success')) installed = true;
+      console.log(`[SETUP] Install attempt ${attempt}/3...`);
+
+      // Capture both stdout and stderr from adb install
+      let result = '';
+      try {
+        result = run('adb install -r -t -g /tmp/whatsapp.apk 2>&1', 300000);
+      } catch (e) {
+        result = e.message || '';
       }
+      console.log(`[SETUP] Install output: ${result}`);
+
+      if (result.toLowerCase().includes('success')) {
+        installed = true;
+        break;
+      }
+
+      // Print specific failure reason if present
+      if (result.includes('INSTALL_FAILED')) {
+        console.error(`[SETUP] Install failed: ${result}`);
+        // INSTALL_FAILED_NO_MATCHING_ABIS means wrong architecture
+        if (result.includes('INSTALL_FAILED_NO_MATCHING_ABIS')) {
+          throw new Error('APK architecture does not match emulator — need x86 or armeabi-v7a APK');
+        }
+        break; // Don't retry on definitive install failures
+      }
+
+      // Verify package actually exists after install
+      await WAIT_MS(2000);
+      const pkgCheck = run('adb shell pm list packages 2>/dev/null', 10000);
+      if (pkgCheck.includes('com.whatsapp')) {
+        console.log('[SETUP] Package verified in pm list');
+        installed = true;
+        break;
+      }
+
+      console.error(`[SETUP] Package not found after install attempt ${attempt}`);
     } catch (e) {
-      console.error(`[SETUP] Repack failed: ${e.message}`);
+      console.error(`[SETUP] Install attempt ${attempt} error: ${e.message}`);
+      if (e.message.includes('architecture')) throw e; // Don't retry arch errors
+      if (attempt < 3) {
+        await WAIT_MS(10000);
+        run('adb kill-server', 10000);
+        await WAIT_MS(2000);
+        run('adb start-server', 10000);
+        await WAIT_MS(3000);
+      }
     }
   }
-
-  // Final pm list check
-  if (!installed) {
-    await WAIT_MS(3000);
-    const pkgCheck = run('adb shell pm list packages 2>/dev/null', 10000);
-    if (pkgCheck.includes('com.whatsapp')) {
-      console.log('[SETUP] Package found in pm list — install succeeded');
-      installed = true;
-    }
-  }
-
-  if (!installed) {
-    throw new Error(`WhatsApp install failed. Last output: ${result}`);
-  }
+  if (!installed) throw new Error('WhatsApp APK install failed after 3 attempts — check APK architecture matches emulator (need armeabi-v7a or x86)');
   console.log('[SETUP] WhatsApp installed successfully');
   await WAIT_MS(2000);
 }
 
+// ── Main registration flow ────────────────────────────────────────────────────
+
+async function main() {
+  try {
+    console.log(`[MAIN] Starting registration for ${PHONE}`);
+
+    // Give emulator a moment after boot-completed signal
+    await WAIT_MS(5000);
+
+    // Verify emulator is responsive
+    const bootProp = run('adb shell getprop sys.boot_completed', 10000);
+    if (bootProp.trim() !== '1') {
+      throw new Error(`Emulator not ready, boot_completed=${bootProp}`);
+    }
+    console.log('[MAIN] Emulator is ready');
+
+    // ── Unlock the screen ─────────────────────────────────────────────────
+    // The emulator boots to a lock screen. Must unlock before launching apps.
+    console.log('[MAIN] Unlocking screen...');
+    run('adb shell input keyevent KEYCODE_WAKEUP', 5000);       // Wake screen
+    await WAIT_MS(1000);
+    run('adb shell input keyevent KEYCODE_MENU', 5000);          // Trigger unlock
+    await WAIT_MS(500);
+    run('adb shell input swipe 540 1800 540 200 300', 5000);     // Swipe up to unlock
+    await WAIT_MS(1000);
+    run('adb shell input keyevent KEYCODE_HOME', 5000);          // Go to home screen
+    await WAIT_MS(2000);
+
+    // Disable lock screen permanently for this session
+    run('adb shell settings put secure lockscreen.disabled 1', 5000);
+    run('adb shell settings put global stay_on_while_plugged_in 3', 5000);
+
+    // Confirm we are on home screen
+    const unlockCheck = await dumpUI(5000);
+    console.log('[MAIN] Screen after unlock:');
+    await getCurrentScreen();
+
+    await installWhatsApp();
+
+    // ── Launch WhatsApp ───────────────────────────────────────────────────
+    console.log('[MAIN] Launching WhatsApp...');
+
+    // Clear logcat so we get clean output from WhatsApp launch
+    run('adb logcat -c', 5000);
+
+    // Go to home screen first
+    run('adb shell input keyevent KEYCODE_HOME', 3000);
+    await WAIT_MS(1000);
+
+    // Verify WhatsApp is actually installed before launching
+    const allPkgs = run('adb shell pm list packages 2>/dev/null', 10000);
+    const pkgFound = allPkgs.includes('com.whatsapp');
+    console.log(`[MAIN] WhatsApp installed: ${pkgFound}`);
+    if (!pkgFound) {
+      throw new Error('WhatsApp package not found — installation failed silently');
+    }
+
+    // Launch WhatsApp
+    const launchOut = run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
+    console.log(`[MAIN] Launch output: ${launchOut}`);
+    await WAIT_MS(6000);
+
+    // Capture logcat to see what WhatsApp is doing
+    const logcat = run('adb logcat -d -t 50 -s WhatsApp:* AndroidRuntime:E ActivityManager:I', 8000);
+    console.log(`[MAIN] Logcat after launch:
+${logcat}`);
+
+    await getCurrentScreen();
+
+    // ── Dismiss crash dialog if WhatsApp keeps stopping ───────────────────
+    // This happens when the APK architecture doesn't match the emulator.
+    // "google_apis" target includes ARM translation so this should not appear,
+    // but handle it defensively just in case.
+    const crashXml = await dumpUI(3000);
+    if (crashXml && crashXml.includes('keeps stopping')) {
+      console.error('[MAIN] WhatsApp crash detected — "keeps stopping" dialog');
+      console.error('[MAIN] This usually means ARM/x86 architecture mismatch');
+      // Try closing and relaunching once
+      run('adb shell input keyevent KEYCODE_BACK', 3000);
+      await WAIT_MS(1000);
+      for (const btn of ['Close app', 'OK', 'Close']) {
+        if (crashXml.includes(btn)) {
+          await tapText(btn, 5000);
+          break;
+        }
+      }
+      await WAIT_MS(3000);
+      // Check if still crashing
+      const stillCrash = await dumpUI(3000);
+      if (stillCrash && stillCrash.includes('keeps stopping')) {
+        await sendWebhook('bad_number', { reason: 'WhatsApp crashes on launch — architecture mismatch or corrupted APK' });
+        process.exit(0);
+      }
+    }
+
+    await getCurrentScreen();
+
+    // ── Agree & Continue (first launch) ──────────────────────────────────
+    // WhatsApp shows "AGREE AND CONTINUE" on very first launch
+    for (const agreeText of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE AND CONTINUE', 'AGREE', 'Accept', 'I agree']) {
+      const xml = await dumpUI(3000);
+      if (xml && xml.toLowerCase().includes(agreeText.toLowerCase())) {
+        console.log(`[MAIN] Found agree button: "${agreeText}"`);
+        await tapText(agreeText, 8000);
+        await WAIT_MS(4000);
+        break;
+      }
+    }
+
+    await getCurrentScreen();
+
+    // ── Phone number entry ────────────────────────────────────────────────
+    // Wait up to 60s total for any variant of the phone number screen
+    let phoneScreenXml = null;
+    const phoneScreenTexts = [
+      'Enter your phone number',
+      'Your phone number',
+      'phone number',
+      'enter your phone',
+      'Enter phone',
+      'Phone number',
+      'country code',
+      'Country code',
+    ];
+
+    console.log('[MAIN] Waiting for phone number entry screen...');
+    const phoneDeadline = Date.now() + 60000;
+    while (Date.now() < phoneDeadline && !phoneScreenXml) {
+      const xml = await dumpUI(5000);
+      for (const t of phoneScreenTexts) {
+        if (xml && xml.toLowerCase().includes(t.toLowerCase())) {
+          console.log(`[MAIN] Phone screen found via: "${t}"`);
+          phoneScreenXml = xml;
+          break;
+        }
+      }
+      if (!phoneScreenXml) {
+        await getCurrentScreen();
+        await WAIT_MS(3000);
+      }
+    }
+
+    if (!phoneScreenXml) {
+      await getCurrentScreen();
+      await sendWebhook('bad_number', { reason: 'Phone number entry screen not found after agree' });
+      process.exit(0); // exit(0) — bot already notified, skip if:failure() step
+    }
+
+    console.log('[MAIN] Phone number screen found');
+    await WAIT_MS(1000);
+
+    // The phone number field — clear it and type the number
+    // First clear whatever country code is pre-filled
+    keyevent('KEYCODE_CTRL_A');
+    await WAIT_MS(300);
+    keyevent('KEYCODE_DEL');
+    await WAIT_MS(300);
+
+    // Type the full number
+    typeText(PHONE);
+    await WAIT_MS(1000);
+
+    console.log(`[MAIN] Typed phone number: ${PHONE}`);
+    await getCurrentScreen();
+
+    // Tap Next / arrow button
+    let nextTapped = false;
+    for (const nextText of ['Next', 'NEXT', 'next', 'Done', 'Continue']) {
+      const xml = await dumpUI(3000);
+      if (xml && xml.includes(nextText)) {
+        await tapText(nextText, 5000);
+        nextTapped = true;
+        break;
+      }
+    }
+    if (!nextTapped) {
+      // Fallback: tap the next arrow (usually at ~980, 1800 on Pixel 4)
+      console.log('[MAIN] Next button not found by text — tapping by coordinate');
+      tap(980, 1800);
+    }
+    await WAIT_MS(4000);
+
+    await getCurrentScreen();
+
+    // ── Check screens after tapping Next ─────────────────────────────────
+    const postNextXml = await dumpUI();
+
+    // Rate limited
+    if (postNextXml.includes('Try again') || postNextXml.includes('try again') ||
+        postNextXml.includes('wait') || postNextXml.includes('Wait')) {
+      const secs = parseWaitSeconds(postNextXml);
+      console.log(`[MAIN] Rate limited — wait ${secs}s`);
+      await sendWebhook('rate_limited', { wait_seconds: secs });
+      process.exit(0);
+    }
+
+    // Invalid number
+    if (postNextXml.includes('not a valid') || postNextXml.includes('Invalid') ||
+        postNextXml.includes('invalid') || postNextXml.includes('Enter a valid')) {
+      await sendWebhook('bad_number', { reason: 'WhatsApp: invalid phone number' });
+      process.exit(0);
+    }
+
+    // Already registered
+    if (postNextXml.includes('already have an account') || postNextXml.includes('already registered') ||
+        postNextXml.includes('Welcome back')) {
+      await sendWebhook('already_registered');
+      process.exit(0);
+    }
+
+    // ── Confirmation dialog — "We will send an SMS" ───────────────────────
+    // WhatsApp shows a confirmation popup with the number before sending OTP
+    for (const confirmText of ['OK', 'Yes', 'Send SMS', 'SEND SMS', 'Send', 'Confirm']) {
+      const xml = await dumpUI(3000);
+      if (xml && xml.includes(confirmText)) {
+        console.log(`[MAIN] Confirmation dialog — tapping "${confirmText}"`);
+        await tapText(confirmText, 5000);
+        await WAIT_MS(2000);
+        break;
+      }
+    }
+
+    // ── OTP sending confirmation ──────────────────────────────────────────
+    // Wait for the OTP input screen or "Verifying" state
+    let otpScreenFound = false;
+    for (const otpText of [
+      'Enter the 6-digit code', 'Enter code', 'Verifying', 'enter the 6',
+      'code sent', 'Didn\'t receive', 'Resend SMS', 'resend',
+    ]) {
+      const xml = await waitForText(otpText, 30000);
+      if (xml) {
+        otpScreenFound = true;
+        console.log(`[MAIN] OTP screen detected via: "${otpText}"`);
+        break;
+      }
+    }
+
+    if (!otpScreenFound) {
+      await getCurrentScreen();
+      await sendWebhook('bad_number', { reason: 'OTP screen not reached after phone entry' });
+      process.exit(0); // exit(0) — bot already notified, skip if:failure() step
+    }
+
+    // ── Notify bot OTP was sent ───────────────────────────────────────────
+    await sendWebhook('otp_requested');
+    console.log('[MAIN] OTP requested — waiting for user reply on Telegram (13 min)...');
+
+    // ── Poll for OTP ──────────────────────────────────────────────────────
+    const otp = await pollForOtp();
+    if (!otp) {
+      console.log('[MAIN] OTP timed out');
+      process.exit(0);
+    }
+
+    console.log(`[MAIN] Entering OTP: ${otp}`);
+
+    // Clear any existing digits and enter OTP
+    // WhatsApp OTP screen usually has 6 individual boxes or one field
+    keyevent('KEYCODE_CTRL_A');
+    await WAIT_MS(200);
+    keyevent('KEYCODE_DEL');
+    await WAIT_MS(200);
+
+    // Type digit by digit with small delay (works for both single field and boxes)
+    for (const digit of otp) {
+      typeText(digit);
+      await WAIT_MS(300);
+    }
+    await WAIT_MS(4000);
+
+    // ── Check OTP result ──────────────────────────────────────────────────
+    const resultXml = await dumpUI();
+    console.log('[MAIN] OTP result screen:');
+    await getCurrentScreen();
+
+    if (resultXml.includes('Wrong code') || resultXml.includes('wrong code') ||
+        resultXml.includes('incorrect') || resultXml.includes('Invalid code')) {
+      await sendWebhook('otp_error');
+      process.exit(0);
+    }
+
+    if (resultXml.includes('two-step') || resultXml.includes('Two-step') ||
+        resultXml.includes('passkey') || resultXml.includes('Passkey') ||
+        resultXml.includes('fingerprint') || resultXml.includes('2FA')) {
+      await sendWebhook('bad_number', { reason: '2FA/passkey required' });
+      process.exit(0);
+    }
+
+    // ── Skip optional setup screens ───────────────────────────────────────
+    for (let i = 0; i < 5; i++) {
+      const xml = await dumpUI(3000);
+      let skipped = false;
+      for (const skipText of ['Skip', 'Not now', 'Continue', 'Allow', 'SKIP', 'Later']) {
+        if (xml && xml.includes(skipText)) {
+          await tapText(skipText, 5000);
+          await WAIT_MS(2000);
+          skipped = true;
+          break;
+        }
+      }
+      if (!skipped) break;
+    }
+
+    // ── Success ───────────────────────────────────────────────────────────
+    await sendWebhook('registered');
+    console.log(`[MAIN] ${PHONE} registered successfully`);
+    process.exit(0);
+
+  } catch (err) {
+    console.error('[MAIN] Fatal error:', err.message);
+    console.error(err.stack);
+    await sendWebhook('bad_number', { reason: `Script error: ${err.message}` });
+    process.exit(0); // exit(0) — bot already notified, skip if:failure() step
+  }
+}
+
+main();
