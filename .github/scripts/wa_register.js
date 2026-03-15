@@ -581,6 +581,8 @@ async function main() {
   if (langXml2.includes('Choose your language') || langXml2.includes('Welcome to WhatsApp')) {
     log('MAIN', 'Language screen — tapping arrow');
     const arrowTapped =
+      await tapElement('Ok', langXml2) ||
+      await tapElement('OK', langXml2) ||
       await tapElement('next', langXml2) ||
       await tapElement('Next', langXml2) ||
       await tapElement('Continue', langXml2);
