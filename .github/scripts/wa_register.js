@@ -631,14 +631,27 @@ async function main() {
   if (agreeResult.matched) {
     log('MAIN', `Agree/phone screen: "${agreeResult.matched}"`);
     const agreeXml = await dumpUI();
-    for (const btn of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree']) {
-      if (agreeXml.includes(btn)) {
-        await tapElement(btn, agreeXml);
-        await sleep(4000);
-        break;
-      }
+
+    // Use resource-id first — most reliable
+    const agreeTapped =
+      await tapById('com.whatsapp:id/eula_accept', agreeXml) ||
+      await tapById('com.whatsapp:id/agree_and_continue_button', agreeXml) ||
+      await tapElement('AGREE AND CONTINUE', agreeXml) ||
+      await tapElement('Agree and continue', agreeXml) ||
+      await tapElement('AGREE', agreeXml) ||
+      await tapElement('Accept', agreeXml);
+
+    if (!agreeTapped) {
+      log('MAIN', 'Agree button not found — tapping bottom-center (540, 1882)');
+      tap(540, 1882);
     }
+    await sleep(4000);
     await logScreen('POST-AGREE');
+
+    // Log resource IDs of the screen that appears after agree
+    const postAgreeXml2 = await dumpUI();
+    const postAgreeIds = [...postAgreeXml2.matchAll(/resource-id="([^"]+)"/g)].map(m => m[1]);
+    log('POST-AGREE-IDS', [...new Set(postAgreeIds)].join(' | '));
   }
 
   await logScreen('AFTER-AGREE-DONE');
