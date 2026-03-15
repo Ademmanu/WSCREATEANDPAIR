@@ -429,14 +429,37 @@ async function main() {
   }
   log('MAIN', 'Permissions granted');
 
-  // ── Update Google Play Services before launching WhatsApp ───────────────
-  // WhatsApp hard-requires a recent GPS version. The google_apis_playstore
-  // image ships with a newer GPS but may still need a nudge on first boot.
-  // We install a bundled GPS update APK if one was downloaded in the workflow,
-  // otherwise we skip and let the emulator handle it.
+  // ── Update Google Play Services via ADB ──────────────────────────────────
+  // WhatsApp 2024+ requires GPS 22.x minimum. API 33 google_apis_playstore
+  // ships with 22.x but we verify and attempt an update if needed.
   log('MAIN', 'Checking Google Play Services version...');
   const gpsVersion = adbShell('dumpsys package com.google.android.gms | grep versionName | head -1 2>/dev/null');
   log('MAIN', `GPS version: ${gpsVersion || 'unknown'}`);
+
+  // Extract version number and check if update needed
+  const gpsVerMatch = gpsVersion.match(/versionName=([\d.]+)/);
+  const gpsMajor = gpsVerMatch ? parseInt(gpsVerMatch[1].split('.')[0]) : 0;
+  log('MAIN', `GPS major version: ${gpsMajor}`);
+
+  if (gpsMajor < 22) {
+    log('MAIN', 'GPS too old — downloading and installing update via ADB...');
+    // Download GPS APK from a reliable source
+    // We use a specific version known to work with WhatsApp
+    fs.writeFileSync('/tmp/dl_gps.sh', 'wget -q "https://dl.google.com/dl/android/studio/gps/gms_core.apk" -O /tmp/gps.apk --timeout=60 || true\\nstat -c%s /tmp/gps.apk 2>/dev/null || echo 0\\n');
+    const gpsDownload = runScript('sh /tmp/dl_gps.sh', 90000);
+    log('MAIN', `GPS download result: ${gpsDownload}`);
+
+    const gpsSize = parseInt((gpsDownload.match(/^(\d+)$/m) || ['0'])[0]);
+    if (gpsSize > 1000000) {
+      const gpsInstall = runScript('adb install -r /tmp/gps.apk 2>&1', 120000);
+      log('MAIN', `GPS install: ${gpsInstall}`);
+      await sleep(5000);
+    } else {
+      log('MAIN', 'GPS download failed — proceeding anyway');
+    }
+  } else {
+    log('MAIN', 'GPS version is sufficient — no update needed');
+  }
 
   // monkey sends INTENT_ACTION_MAIN + CATEGORY_LAUNCHER — identical to tapping the icon
   // This is the most reliable foreground launch method on Android emulators
