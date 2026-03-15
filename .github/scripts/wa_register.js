@@ -465,34 +465,7 @@ async function main() {
   }
 
 
-  // ── 5. Language screen → Accept terms ───────────────────────────────────
-  // Newer WhatsApp shows a language picker first. Bottom-left arrow navigates
-  // to the AGREE AND CONTINUE screen.
-  log('MAIN', 'Checking for language screen...');
-
-  const langXml = await dumpUI(6000);
-  if (langXml.includes('Choose your language') || langXml.includes('Welcome to WhatsApp')) {
-    log('MAIN', 'Language screen detected — tapping next arrow');
-
-    // The arrow is at bottom-left of Pixel 4 (1080x2280 screen)
-    // Approximate coords: x=108, y=2100 (bottom-left corner)
-    // Also try content-desc variants WhatsApp uses for the arrow
-    const arrowTapped =
-      await tapElement('next', langXml) ||
-      await tapElement('Next', langXml) ||
-      await tapElement('arrow', langXml) ||
-      await tapElement('Continue', langXml);
-
-    if (!arrowTapped) {
-      // Tap bottom-left arrow by coordinate
-      log('MAIN', 'Arrow not found by text — tapping bottom-left coordinate');
-      tap(108, 2100);
-    }
-    await sleep(3000);
-    await logScreen('POST-LANGUAGE');
-  }
-
-  // ── Accept terms ─────────────────────────────────────────────────────────
+  // ── 5. Accept terms ──────────────────────────────────────────────────────
   const agreeResult = await waitForAny([
     'AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree',
     'Enter your phone number', 'Your phone number', 'Phone number', 'Country',
