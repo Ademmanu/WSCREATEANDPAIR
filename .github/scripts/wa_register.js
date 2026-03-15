@@ -581,8 +581,6 @@ async function main() {
   if (langXml2.includes('Choose your language') || langXml2.includes('Welcome to WhatsApp')) {
     log('MAIN', 'Language screen — tapping arrow');
     const arrowTapped =
-      await tapElement('Ok', langXml2) ||
-      await tapElement('OK', langXml2) ||
       await tapElement('next', langXml2) ||
       await tapElement('Next', langXml2) ||
       await tapElement('Continue', langXml2);
@@ -592,11 +590,10 @@ async function main() {
 
   const agreeResult = await waitForAny([
     'AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree',
-    'Enter your phone number', 'Your phone number', 'Phone number', 'Country',
   ], 30000);
 
   if (agreeResult.matched) {
-    log('MAIN', `Agree/phone screen: "${agreeResult.matched}"`);
+    log('MAIN', `Agree screen: "${agreeResult.matched}"`);
     const agreeXml = await dumpUI();
     for (const btn of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree']) {
       if (agreeXml.includes(btn)) {
