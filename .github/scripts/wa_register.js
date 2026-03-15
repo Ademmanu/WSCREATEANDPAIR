@@ -606,8 +606,72 @@ async function main() {
     await logScreen('POST-AGREE');
   }
 
-  // ── Done for now — step by step ─────────────────────────────────────────
   await logScreen('AFTER-AGREE-DONE');
+
+  // ── Step 1: Edit country code field (clear "1", type cc) ─────────────────
+  log('MAIN', `Editing country code field → ${phoneInfo.countryCode}`);
+
+  // The country code field shows as "Country code for United States, plus 1"
+  // Tap the field that contains the current code number
+  const ccXml = await dumpUI();
+
+  // Try tapping by content-desc containing "plus" or "Country code"
+  let ccTapped = false;
+  const ccPatterns = ['plus 1', 'Country code', 'country code', 'plus'];
+  for (const pat of ccPatterns) {
+    if (ccXml.includes(pat)) {
+      ccTapped = await tapElement(pat, ccXml);
+      if (ccTapped) break;
+    }
+  }
+  if (!ccTapped) {
+    // Fallback: the +code field is usually at approx x=175, y=700 on Pixel 4 API33
+    log('MAIN', 'CC field not found by text — tapping coordinate (175, 700)');
+    tap(175, 700);
+  }
+  await sleep(1000);
+
+  // Select all and delete existing code, then type new country code
+  keyevent('KEYCODE_CTRL_A');
+  await sleep(200);
+  keyevent('KEYCODE_DEL');
+  await sleep(200);
+  typeText(phoneInfo.countryCode);
+  await sleep(800);
+  await logScreen('POST-CC-EDIT');
+
+  // ── Step 2: Enter national number in Phone number field ───────────────────
+  log('MAIN', `Entering national number → ${phoneInfo.nationalNumber}`);
+
+  const numXml = await dumpUI();
+  const numTapped = await tapElement('Phone number', numXml);
+  if (!numTapped) {
+    // Fallback: phone number field is usually at approx x=650, y=700
+    log('MAIN', 'Phone number field not found by text — tapping coordinate (650, 700)');
+    tap(650, 700);
+  }
+  await sleep(800);
+
+  // Clear and type national number
+  keyevent('KEYCODE_CTRL_A');
+  await sleep(200);
+  keyevent('KEYCODE_DEL');
+  await sleep(200);
+  typeText(phoneInfo.nationalNumber);
+  await sleep(800);
+  await logScreen('POST-NUMBER-ENTRY');
+
+  // ── Step 3: Tap NEXT ──────────────────────────────────────────────────────
+  log('MAIN', 'Tapping NEXT...');
+  const nextXml = await dumpUI();
+  const nextTapped = await tapElement('NEXT', nextXml) || await tapElement('Next', nextXml);
+  if (!nextTapped) {
+    log('MAIN', 'NEXT not found by text — tapping coordinate (540, 2104)');
+    tap(540, 2104);
+  }
+  await sleep(4000);
+  await logScreen('POST-NEXT');
+
   log('MAIN', 'Stopping here — step by step mode');
 }
 
