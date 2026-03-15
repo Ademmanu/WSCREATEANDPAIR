@@ -1,144 +1,210 @@
 /**
- * wa_register.js
- * Drives WhatsApp registration via ADB on a GitHub Actions Android emulator.
+ * wa_register.js — WhatsApp registration automation via ADB
  *
- * Key design decisions:
- * - Uses `adb shell` directly via execSync with shell: true to avoid quoting issues
- * - Dumps UI to /sdcard/ui.xml (not /dev/stdout which is unreliable)
- * - Logs every screen state for easy debugging
- * - All waits are generous to account for slow emulator rendering
+ * Runs inside GitHub Actions after the Android emulator boots.
+ * Installs WhatsApp, navigates the registration flow, requests OTP,
+ * waits for the user to reply on Telegram, submits the OTP, and
+ * reports the result back to the bot via webhook.
+ *
+ * Required env vars:
+ *   PHONE_NUMBER, TELEGRAM_USER_ID, WEBHOOK_URL,
+ *   WEBHOOK_SECRET, GITHUB_RUN_ID
  */
 
 'use strict';
 
-const { execSync } = require('child_process');
-const https = require('https');
-const http = require('http');
-const fs = require('fs');
+const { execSync }  = require('child_process');
+const { execFile }  = require('child_process');
+const https         = require('https');
+const http          = require('http');
+const fs            = require('fs');
+const path          = require('path');
 
-const PHONE      = process.env.PHONE_NUMBER;
-const USER_ID    = process.env.TELEGRAM_USER_ID;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const PHONE          = process.env.PHONE_NUMBER;
+const USER_ID        = process.env.TELEGRAM_USER_ID;
+const WEBHOOK_URL    = process.env.WEBHOOK_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
-const RUN_ID     = process.env.GITHUB_RUN_ID;
-const RENDER_BASE = WEBHOOK_URL.replace('/webhook/event', '');
+const RUN_ID         = process.env.GITHUB_RUN_ID;
+const RENDER_BASE    = WEBHOOK_URL.replace('/webhook/event', '');
+const WA_PACKAGE     = 'com.whatsapp';
+const APK_PATH       = '/tmp/whatsapp.apk';
+const SCRIPT_DIR     = '/tmp/wa_scripts';
 
-const WA_PACKAGE = 'com.whatsapp';
-const WAIT_MS = (ms) => new Promise(r => setTimeout(r, ms));
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
-// ── ADB helpers ───────────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Run any shell command directly (not wrapped in adb shell "...")
-function run(cmd, timeoutMs = 30000) {
+function log(tag, msg) {
+  const ts = new Date().toISOString().substr(11, 8);
+  console.log(`[${ts}] [${tag}] ${msg}`);
+}
+
+// Write a shell script to disk and execute it.
+// This avoids ALL quoting issues — the command is never interpolated.
+function runScript(scriptContent, timeoutMs = 30000) {
+  fs.mkdirSync(SCRIPT_DIR, { recursive: true });
+  const file = path.join(SCRIPT_DIR, `cmd_${Date.now()}.sh`);
+  fs.writeFileSync(file, `#!/bin/sh\n${scriptContent}\n`, { mode: 0o755 });
   try {
-    return execSync(cmd, {
+    const out = execSync(`sh ${file}`, {
       timeout: timeoutMs,
       encoding: 'utf8',
-      shell: '/bin/sh',
       stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
+    });
+    return (out || '').trim();
   } catch (e) {
-    return (e.stdout || '').trim();
+    return ((e.stdout || '') + (e.stderr || '')).trim();
+  } finally {
+    try { fs.unlinkSync(file); } catch (_) {}
   }
 }
 
-// Run a command inside the emulator via adb shell
-function shell(cmd, timeoutMs = 30000) {
-  // Write command to a temp script to avoid quoting hell
-  const script = `/tmp/adb_cmd_${Date.now()}.sh`;
-  fs.writeFileSync(script, `#!/bin/sh\n${cmd}\n`);
-  const result = run(`adb shell < ${script}`, timeoutMs);
-  try { fs.unlinkSync(script); } catch (_) {}
-  return result;
+// Run an adb command (not adb shell — for host-side adb commands)
+function adb(args, timeoutMs = 30000) {
+  return runScript(`adb ${args} 2>&1`, timeoutMs);
 }
+
+// Run a command inside the Android emulator via adb shell
+// cmd is written to a file — no shell escaping needed
+function adbShell(cmd, timeoutMs = 30000) {
+  const file = path.join(SCRIPT_DIR, `shell_${Date.now()}.sh`);
+  fs.mkdirSync(SCRIPT_DIR, { recursive: true });
+  fs.writeFileSync(file, `#!/bin/sh\n${cmd}\n`, { mode: 0o755 });
+  const out = runScript(`adb shell < ${file}`, timeoutMs);
+  try { fs.unlinkSync(file); } catch (_) {}
+  return out;
+}
+
+// ── ADB input helpers ─────────────────────────────────────────────────────────
 
 function tap(x, y) {
-  run(`adb shell input tap ${x} ${y}`);
+  adbShell(`input tap ${x} ${y}`);
 }
 
-function typeText(text) {
-  // Use adb shell input text — escape special chars
-  const safe = text.replace(/([\\$`"&|;<>(){}!#])/g, '\\$1');
-  run(`adb shell input text "${safe}"`);
+function swipe(x1, y1, x2, y2, durationMs = 300) {
+  adbShell(`input swipe ${x1} ${y1} ${x2} ${y2} ${durationMs}`);
 }
 
 function keyevent(code) {
-  run(`adb shell input keyevent ${code}`);
+  adbShell(`input keyevent ${code}`);
 }
 
-// ── UI dump and search ────────────────────────────────────────────────────────
+// Type text safely — write each char via keyevent to avoid encoding issues
+function typeText(text) {
+  // Use ADB text input — works for ASCII digits and letters
+  // Write to a script so special chars don't get shell-interpreted
+  const safe = text.replace(/[^a-zA-Z0-9+]/g, (c) => {
+    // Encode non-alphanumeric chars for adb input text
+    return encodeURIComponent(c).replace(/%/g, '%25');
+  });
+  adbShell(`input text "${safe}"`);
+}
 
-async function dumpUI(timeoutMs = 10000) {
-  // Dump to sdcard then pull — more reliable than /dev/stdout
+// Type digits individually via tap on the number (most reliable for OTP boxes)
+function typeDigits(digits) {
+  for (const d of digits) {
+    adbShell(`input text ${d}`);
+    runScript('sleep 0.2');
+  }
+}
+
+// ── UI inspection ─────────────────────────────────────────────────────────────
+
+// Dump UI hierarchy to XML and return it
+// Retries until valid XML is returned or timeout
+async function dumpUI(timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    run('adb shell uiautomator dump /sdcard/ui.xml', 8000);
-    const xml = run('adb shell cat /sdcard/ui.xml', 5000);
+    adbShell('uiautomator dump /sdcard/ui.xml');
+    const xml = adbShell('cat /sdcard/ui.xml', 5000);
     if (xml && xml.includes('<hierarchy')) return xml;
-    await WAIT_MS(1000);
+    await sleep(1000);
   }
   return '';
 }
 
-async function waitForText(text, timeoutMs = 60000) {
-  console.log(`[UI] Waiting for: "${text}" (${timeoutMs/1000}s timeout)`);
+// Return up to 15 visible text strings from current screen
+async function screenTexts() {
+  const xml = await dumpUI();
+  const texts = [];
+  const re = /text="([^"]{1,60})"/g;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const t = m[1].trim();
+    if (t) texts.push(t);
+  }
+  return [...new Set(texts)].slice(0, 15);
+}
+
+async function logScreen(label = 'SCREEN') {
+  const texts = await screenTexts();
+  log(label, texts.join(' | ') || '(empty)');
+  return texts;
+}
+
+// Wait until the screen contains a specific string
+// Returns the full XML when found, null on timeout
+async function waitForScreen(text, timeoutMs = 60000) {
+  log('WAIT', `"${text}" (${timeoutMs / 1000}s)`);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const xml = await dumpUI();
-    if (xml.includes(text)) {
-      console.log(`[UI] Found: "${text}"`);
+    if (xml.toLowerCase().includes(text.toLowerCase())) {
+      log('FOUND', `"${text}"`);
       return xml;
     }
-    await WAIT_MS(2000);
+    await sleep(2000);
   }
-  console.log(`[UI] Timeout waiting for: "${text}"`);
+  log('TIMEOUT', `"${text}" not found`);
   return null;
 }
 
-async function tapText(text, timeoutMs = 30000) {
-  const xml = await waitForText(text, timeoutMs);
-  if (!xml) return false;
-
-  // Extract bounds for the element containing this text
-  const regex = new RegExp(
-    `text="${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`,
-    'i'
-  );
-  // Also try content-desc
-  const regex2 = new RegExp(
-    `content-desc="${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`,
-    'i'
-  );
-
-  let match = xml.match(regex) || xml.match(regex2);
-  if (match) {
-    const cx = Math.round((parseInt(match[1]) + parseInt(match[3])) / 2);
-    const cy = Math.round((parseInt(match[2]) + parseInt(match[4])) / 2);
-    console.log(`[UI] Tapping "${text}" at (${cx}, ${cy})`);
-    tap(cx, cy);
-    await WAIT_MS(1000);
-    return true;
+// Wait for any one of multiple strings — returns { xml, matched }
+async function waitForAny(texts, timeoutMs = 60000) {
+  log('WAIT', `any of: ${texts.map(t => `"${t}"`).join(', ')} (${timeoutMs / 1000}s)`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const xml = await dumpUI();
+    for (const text of texts) {
+      if (xml.toLowerCase().includes(text.toLowerCase())) {
+        log('FOUND', `"${text}"`);
+        return { xml, matched: text };
+      }
+    }
+    await sleep(2000);
   }
-
-  console.log(`[UI] Could not find bounds for "${text}" — tapping center`);
-  tap(540, 1140); // Pixel 4 center as fallback
-  return false;
+  log('TIMEOUT', `none of [${texts.join(', ')}] found`);
+  return { xml: '', matched: null };
 }
 
-async function getCurrentScreen() {
-  const xml = await dumpUI(5000);
-  // Log a summary of what's on screen for debugging
-  const texts = [];
-  const re = /text="([^"]{2,40})"/g;
-  let m;
-  while ((m = re.exec(xml)) !== null) texts.push(m[1]);
-  console.log(`[SCREEN] Visible text: ${texts.slice(0, 10).join(' | ')}`);
-  return xml;
+// Find element bounds by text and tap it
+async function tapElement(text, xml = null) {
+  if (!xml) xml = await dumpUI();
+  const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns = [
+    new RegExp(`text="${escaped}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`, 'i'),
+    new RegExp(`content-desc="${escaped}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`, 'i'),
+  ];
+  for (const re of patterns) {
+    const m = xml.match(re);
+    if (m) {
+      const cx = Math.round((+m[1] + +m[3]) / 2);
+      const cy = Math.round((+m[2] + +m[4]) / 2);
+      log('TAP', `"${text}" → (${cx},${cy})`);
+      tap(cx, cy);
+      await sleep(800);
+      return true;
+    }
+  }
+  log('TAP', `"${text}" bounds not found — skipping`);
+  return false;
 }
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
 
-function sendWebhook(event, extra = {}) {
+function webhook(event, extra = {}) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       event,
@@ -148,9 +214,10 @@ function sendWebhook(event, extra = {}) {
       ...extra,
     });
     const u = new URL(WEBHOOK_URL);
+    const isHttps = u.protocol === 'https:';
     const options = {
       hostname: u.hostname,
-      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      port: u.port || (isHttps ? 443 : 80),
       path: u.pathname,
       method: 'POST',
       headers: {
@@ -159,12 +226,16 @@ function sendWebhook(event, extra = {}) {
         'X-Webhook-Secret': WEBHOOK_SECRET,
       },
     };
-    const lib = u.protocol === 'https:' ? https : http;
+    const lib = isHttps ? https : http;
     const req = lib.request(options, (res) => {
-      console.log(`[WEBHOOK] ${event} → ${res.statusCode}`);
+      log('WEBHOOK', `${event} → HTTP ${res.statusCode}`);
       resolve(res.statusCode);
     });
-    req.on('error', (e) => { console.error(`[WEBHOOK] ${event} error:`, e.message); resolve(0); });
+    req.on('error', (e) => {
+      log('WEBHOOK', `${event} ERROR: ${e.message}`);
+      resolve(0);
+    });
+    req.setTimeout(10000, () => { req.destroy(); resolve(0); });
     req.write(body);
     req.end();
   });
@@ -172,44 +243,47 @@ function sendWebhook(event, extra = {}) {
 
 // ── OTP polling ───────────────────────────────────────────────────────────────
 
+// Poll the bot's /otp/{phone} endpoint until the user replies on Telegram
 async function pollForOtp(timeoutMs = 13 * 60 * 1000) {
-  const otpUrl = `${RENDER_BASE}/otp/${PHONE}`;
+  const otpUrl = `${RENDER_BASE}/otp/${encodeURIComponent(PHONE)}`;
   const deadline = Date.now() + timeoutMs;
-  console.log(`[OTP] Polling ${otpUrl} for up to 13 minutes...`);
+  log('OTP', `Polling ${otpUrl} for up to ${timeoutMs / 60000} min...`);
   while (Date.now() < deadline) {
-    await WAIT_MS(5000);
+    await sleep(5000);
     try {
       const otp = await httpGet(otpUrl, { 'X-Webhook-Secret': WEBHOOK_SECRET });
-      if (otp && /^\d{6}$/.test(otp.trim())) {
-        console.log(`[OTP] Received: ${otp.trim()}`);
-        return otp.trim();
+      if (otp && /^\d{6}$/.test(otp)) {
+        log('OTP', `Received: ${otp}`);
+        return otp;
       }
     } catch (_) {}
   }
+  log('OTP', 'Timed out waiting for user reply');
   return null;
 }
 
 function httpGet(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
-    const lib = u.protocol === 'https:' ? https : http;
-    const req = lib.request({
+    const isHttps = u.protocol === 'https:';
+    const req = (isHttps ? https : http).request({
       hostname: u.hostname,
-      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      port: u.port || (isHttps ? 443 : 80),
       path: u.pathname + u.search,
       method: 'GET',
       headers,
-      timeout: 8000,
     }, (res) => {
       let data = '';
-      res.on('data', d => data += d);
-      res.on('end', () => res.statusCode === 200 ? resolve(data.trim()) : resolve(null));
+      res.on('data', (d) => { data += d; });
+      res.on('end', () => resolve(res.statusCode === 200 ? data.trim() : null));
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.setTimeout(8000, () => { req.destroy(); resolve(null); });
     req.end();
   });
 }
+
+// ── Parse WhatsApp wait time strings ─────────────────────────────────────────
 
 function parseWaitSeconds(text) {
   let total = 0;
@@ -222,394 +296,268 @@ function parseWaitSeconds(text) {
   return total > 0 ? total : 600;
 }
 
-// ── Install WhatsApp ──────────────────────────────────────────────────────────
+// ── APK install ───────────────────────────────────────────────────────────────
 
 async function installWhatsApp() {
-  const apkPath = '/tmp/whatsapp.apk';
-  if (!fs.existsSync(apkPath)) {
-    throw new Error('WhatsApp APK not found at /tmp/whatsapp.apk');
+  if (!fs.existsSync(APK_PATH)) {
+    throw new Error(`APK not found at ${APK_PATH}`);
   }
-  const size = fs.statSync(apkPath).size;
-  console.log(`[SETUP] Installing WhatsApp APK (${(size / 1024 / 1024).toFixed(1)} MB)...`);
+  const sizeMB = (fs.statSync(APK_PATH).size / 1024 / 1024).toFixed(1);
+  log('INSTALL', `APK size: ${sizeMB} MB`);
 
-  await WAIT_MS(3000);
+  // Show which native lib folders the APK contains
+  const libScript = `unzip -l ${APK_PATH} | grep -E "^[[:space:]]+[0-9]" | awk '{print $4}' | grep "^lib/" | cut -d/ -f1-2 | sort -u`;
+  fs.writeFileSync('/tmp/libcheck.sh', libScript);
+  const libs = runScript('sh /tmp/libcheck.sh 2>/dev/null', 15000);
+  log('INSTALL', `APK lib folders:\n${libs || '  (none — pure Java APK)'}`);
 
-  // First check APK architecture to understand what we are installing
-  fs.writeFileSync('/tmp/check_apk.sh', 'unzip -l /tmp/whatsapp.apk 2>/dev/null | grep "lib/" | cut -d/ -f1-3 | sort -u\n');
-  const libFolders = run('sh /tmp/check_apk.sh', 10000);
-  console.log(`[SETUP] APK native libs: ${libFolders || '(none — may be pure Java APK)'}`);
-  console.log(`[SETUP] APK native libs: ${libFolders || '(none found — may be pure Java APK)'}`);
+  // ADB needs a moment after boot
+  await sleep(2000);
 
-  let installed = false;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      console.log(`[SETUP] Install attempt ${attempt}/3...`);
+  const strategies = [
+    `adb install -r -t -g ${APK_PATH}`,
+    `adb install -r -t -g --abi x86_64 ${APK_PATH}`,
+    `adb install -r -t -g --abi x86 ${APK_PATH}`,
+  ];
 
-      // Capture both stdout and stderr from adb install
-      let result = '';
-      try {
-        result = run('adb install -r -t -g /tmp/whatsapp.apk 2>&1', 300000);
-      } catch (e) {
-        result = e.message || '';
-      }
-      console.log(`[SETUP] Install output: ${result}`);
+  for (const [i, cmd] of strategies.entries()) {
+    log('INSTALL', `Attempt ${i + 1}: ${cmd}`);
+    const out = runScript(`${cmd} 2>&1`, 300000);
+    log('INSTALL', `Output: ${out}`);
 
-      if (result.toLowerCase().includes('success')) {
-        installed = true;
-        break;
-      }
+    if (out.toLowerCase().includes('success')) {
+      log('INSTALL', 'Success');
+      return;
+    }
 
-      // Print specific failure reason if present
-      if (result.includes('INSTALL_FAILED')) {
-        console.error(`[SETUP] Install failed: ${result}`);
-        // INSTALL_FAILED_NO_MATCHING_ABIS means wrong architecture
-        if (result.includes('INSTALL_FAILED_NO_MATCHING_ABIS')) {
-          throw new Error('APK architecture does not match emulator — need x86 or armeabi-v7a APK');
-        }
-        break; // Don't retry on definitive install failures
-      }
+    if (out.includes('INSTALL_FAILED_NO_MATCHING_ABIS') && i === strategies.length - 1) {
+      throw new Error('APK has no compatible native libs for this emulator. Upload the x86 or universal variant.');
+    }
 
-      // Verify package actually exists after install
-      await WAIT_MS(2000);
-      const pkgCheck = run('adb shell pm list packages 2>/dev/null', 10000);
-      if (pkgCheck.includes('com.whatsapp')) {
-        console.log('[SETUP] Package verified in pm list');
-        installed = true;
-        break;
-      }
-
-      console.error(`[SETUP] Package not found after install attempt ${attempt}`);
-    } catch (e) {
-      console.error(`[SETUP] Install attempt ${attempt} error: ${e.message}`);
-      if (e.message.includes('architecture')) throw e; // Don't retry arch errors
-      if (attempt < 3) {
-        await WAIT_MS(10000);
-        run('adb kill-server', 10000);
-        await WAIT_MS(2000);
-        run('adb start-server', 10000);
-        await WAIT_MS(3000);
-      }
+    if (out.includes('INSTALL_FAILED') && !out.includes('INSTALL_FAILED_NO_MATCHING_ABIS')) {
+      throw new Error(`Install failed: ${out}`);
     }
   }
-  if (!installed) throw new Error('WhatsApp APK install failed after 3 attempts — check APK architecture matches emulator (need armeabi-v7a or x86)');
-  console.log('[SETUP] WhatsApp installed successfully');
-  await WAIT_MS(2000);
+
+  // Final fallback — check pm list in case install succeeded without printing "Success"
+  await sleep(3000);
+  const installed = runScript('adb shell pm list packages 2>/dev/null | grep com.whatsapp', 10000);
+  if (installed.includes('com.whatsapp')) {
+    log('INSTALL', 'Verified via pm list');
+    return;
+  }
+
+  throw new Error('WhatsApp failed to install after all attempts');
 }
 
-// ── Main registration flow ────────────────────────────────────────────────────
+// ── Screen unlock ─────────────────────────────────────────────────────────────
+
+async function unlockScreen() {
+  log('UNLOCK', 'Waking and unlocking screen...');
+  keyevent('KEYCODE_WAKEUP');
+  await sleep(500);
+  swipe(540, 1800, 540, 900, 400);  // Swipe up to unlock
+  await sleep(500);
+  keyevent('KEYCODE_HOME');
+  await sleep(1000);
+  // Keep screen on for the full session
+  adbShell('settings put global stay_on_while_plugged_in 3');
+  adbShell('settings put secure lockscreen.disabled 1');
+  await logScreen('UNLOCK');
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  try {
-    console.log(`[MAIN] Starting registration for ${PHONE}`);
+  log('MAIN', `Starting registration for ${PHONE}`);
 
-    // Give emulator a moment after boot-completed signal
-    await WAIT_MS(5000);
-
-    // Verify emulator is responsive
-    const bootProp = run('adb shell getprop sys.boot_completed', 10000);
-    if (bootProp.trim() !== '1') {
-      throw new Error(`Emulator not ready, boot_completed=${bootProp}`);
-    }
-    console.log('[MAIN] Emulator is ready');
-
-    // ── Unlock the screen ─────────────────────────────────────────────────
-    // The emulator boots to a lock screen. Must unlock before launching apps.
-    console.log('[MAIN] Unlocking screen...');
-    run('adb shell input keyevent KEYCODE_WAKEUP', 5000);       // Wake screen
-    await WAIT_MS(1000);
-    run('adb shell input keyevent KEYCODE_MENU', 5000);          // Trigger unlock
-    await WAIT_MS(500);
-    run('adb shell input swipe 540 1800 540 200 300', 5000);     // Swipe up to unlock
-    await WAIT_MS(1000);
-    run('adb shell input keyevent KEYCODE_HOME', 5000);          // Go to home screen
-    await WAIT_MS(2000);
-
-    // Disable lock screen permanently for this session
-    run('adb shell settings put secure lockscreen.disabled 1', 5000);
-    run('adb shell settings put global stay_on_while_plugged_in 3', 5000);
-
-    // Confirm we are on home screen
-    const unlockCheck = await dumpUI(5000);
-    console.log('[MAIN] Screen after unlock:');
-    await getCurrentScreen();
-
-    await installWhatsApp();
-
-    // ── Launch WhatsApp ───────────────────────────────────────────────────
-    console.log('[MAIN] Launching WhatsApp...');
-
-    // Clear logcat so we get clean output from WhatsApp launch
-    run('adb logcat -c', 5000);
-
-    // Go to home screen first
-    run('adb shell input keyevent KEYCODE_HOME', 3000);
-    await WAIT_MS(1000);
-
-    // Verify WhatsApp is actually installed before launching
-    const allPkgs = run('adb shell pm list packages 2>/dev/null', 10000);
-    const pkgFound = allPkgs.includes('com.whatsapp');
-    console.log(`[MAIN] WhatsApp installed: ${pkgFound}`);
-    if (!pkgFound) {
-      throw new Error('WhatsApp package not found — installation failed silently');
-    }
-
-    // Launch WhatsApp
-    const launchOut = run('adb shell am start -n com.whatsapp/com.whatsapp.Main', 10000);
-    console.log(`[MAIN] Launch output: ${launchOut}`);
-    await WAIT_MS(6000);
-
-    // Capture logcat to see what WhatsApp is doing
-    const logcat = run('adb logcat -d -t 50 -s WhatsApp:* AndroidRuntime:E ActivityManager:I', 8000);
-    console.log(`[MAIN] Logcat after launch:
-${logcat}`);
-
-    await getCurrentScreen();
-
-    // ── Dismiss crash dialog if WhatsApp keeps stopping ───────────────────
-    // This happens when the APK architecture doesn't match the emulator.
-    // "google_apis" target includes ARM translation so this should not appear,
-    // but handle it defensively just in case.
-    const crashXml = await dumpUI(3000);
-    if (crashXml && crashXml.includes('keeps stopping')) {
-      console.error('[MAIN] WhatsApp crash detected — "keeps stopping" dialog');
-      console.error('[MAIN] This usually means ARM/x86 architecture mismatch');
-      // Try closing and relaunching once
-      run('adb shell input keyevent KEYCODE_BACK', 3000);
-      await WAIT_MS(1000);
-      for (const btn of ['Close app', 'OK', 'Close']) {
-        if (crashXml.includes(btn)) {
-          await tapText(btn, 5000);
-          break;
-        }
-      }
-      await WAIT_MS(3000);
-      // Check if still crashing
-      const stillCrash = await dumpUI(3000);
-      if (stillCrash && stillCrash.includes('keeps stopping')) {
-        await sendWebhook('bad_number', { reason: 'WhatsApp crashes on launch — architecture mismatch or corrupted APK' });
-        process.exit(0);
-      }
-    }
-
-    await getCurrentScreen();
-
-    // ── Agree & Continue (first launch) ──────────────────────────────────
-    // WhatsApp shows "AGREE AND CONTINUE" on very first launch
-    for (const agreeText of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE AND CONTINUE', 'AGREE', 'Accept', 'I agree']) {
-      const xml = await dumpUI(3000);
-      if (xml && xml.toLowerCase().includes(agreeText.toLowerCase())) {
-        console.log(`[MAIN] Found agree button: "${agreeText}"`);
-        await tapText(agreeText, 8000);
-        await WAIT_MS(4000);
-        break;
-      }
-    }
-
-    await getCurrentScreen();
-
-    // ── Phone number entry ────────────────────────────────────────────────
-    // Wait up to 60s total for any variant of the phone number screen
-    let phoneScreenXml = null;
-    const phoneScreenTexts = [
-      'Enter your phone number',
-      'Your phone number',
-      'phone number',
-      'enter your phone',
-      'Enter phone',
-      'Phone number',
-      'country code',
-      'Country code',
-    ];
-
-    console.log('[MAIN] Waiting for phone number entry screen...');
-    const phoneDeadline = Date.now() + 60000;
-    while (Date.now() < phoneDeadline && !phoneScreenXml) {
-      const xml = await dumpUI(5000);
-      for (const t of phoneScreenTexts) {
-        if (xml && xml.toLowerCase().includes(t.toLowerCase())) {
-          console.log(`[MAIN] Phone screen found via: "${t}"`);
-          phoneScreenXml = xml;
-          break;
-        }
-      }
-      if (!phoneScreenXml) {
-        await getCurrentScreen();
-        await WAIT_MS(3000);
-      }
-    }
-
-    if (!phoneScreenXml) {
-      await getCurrentScreen();
-      await sendWebhook('bad_number', { reason: 'Phone number entry screen not found after agree' });
-      process.exit(0); // exit(0) — bot already notified, skip if:failure() step
-    }
-
-    console.log('[MAIN] Phone number screen found');
-    await WAIT_MS(1000);
-
-    // The phone number field — clear it and type the number
-    // First clear whatever country code is pre-filled
-    keyevent('KEYCODE_CTRL_A');
-    await WAIT_MS(300);
-    keyevent('KEYCODE_DEL');
-    await WAIT_MS(300);
-
-    // Type the full number
-    typeText(PHONE);
-    await WAIT_MS(1000);
-
-    console.log(`[MAIN] Typed phone number: ${PHONE}`);
-    await getCurrentScreen();
-
-    // Tap Next / arrow button
-    let nextTapped = false;
-    for (const nextText of ['Next', 'NEXT', 'next', 'Done', 'Continue']) {
-      const xml = await dumpUI(3000);
-      if (xml && xml.includes(nextText)) {
-        await tapText(nextText, 5000);
-        nextTapped = true;
-        break;
-      }
-    }
-    if (!nextTapped) {
-      // Fallback: tap the next arrow (usually at ~980, 1800 on Pixel 4)
-      console.log('[MAIN] Next button not found by text — tapping by coordinate');
-      tap(980, 1800);
-    }
-    await WAIT_MS(4000);
-
-    await getCurrentScreen();
-
-    // ── Check screens after tapping Next ─────────────────────────────────
-    const postNextXml = await dumpUI();
-
-    // Rate limited
-    if (postNextXml.includes('Try again') || postNextXml.includes('try again') ||
-        postNextXml.includes('wait') || postNextXml.includes('Wait')) {
-      const secs = parseWaitSeconds(postNextXml);
-      console.log(`[MAIN] Rate limited — wait ${secs}s`);
-      await sendWebhook('rate_limited', { wait_seconds: secs });
-      process.exit(0);
-    }
-
-    // Invalid number
-    if (postNextXml.includes('not a valid') || postNextXml.includes('Invalid') ||
-        postNextXml.includes('invalid') || postNextXml.includes('Enter a valid')) {
-      await sendWebhook('bad_number', { reason: 'WhatsApp: invalid phone number' });
-      process.exit(0);
-    }
-
-    // Already registered
-    if (postNextXml.includes('already have an account') || postNextXml.includes('already registered') ||
-        postNextXml.includes('Welcome back')) {
-      await sendWebhook('already_registered');
-      process.exit(0);
-    }
-
-    // ── Confirmation dialog — "We will send an SMS" ───────────────────────
-    // WhatsApp shows a confirmation popup with the number before sending OTP
-    for (const confirmText of ['OK', 'Yes', 'Send SMS', 'SEND SMS', 'Send', 'Confirm']) {
-      const xml = await dumpUI(3000);
-      if (xml && xml.includes(confirmText)) {
-        console.log(`[MAIN] Confirmation dialog — tapping "${confirmText}"`);
-        await tapText(confirmText, 5000);
-        await WAIT_MS(2000);
-        break;
-      }
-    }
-
-    // ── OTP sending confirmation ──────────────────────────────────────────
-    // Wait for the OTP input screen or "Verifying" state
-    let otpScreenFound = false;
-    for (const otpText of [
-      'Enter the 6-digit code', 'Enter code', 'Verifying', 'enter the 6',
-      'code sent', 'Didn\'t receive', 'Resend SMS', 'resend',
-    ]) {
-      const xml = await waitForText(otpText, 30000);
-      if (xml) {
-        otpScreenFound = true;
-        console.log(`[MAIN] OTP screen detected via: "${otpText}"`);
-        break;
-      }
-    }
-
-    if (!otpScreenFound) {
-      await getCurrentScreen();
-      await sendWebhook('bad_number', { reason: 'OTP screen not reached after phone entry' });
-      process.exit(0); // exit(0) — bot already notified, skip if:failure() step
-    }
-
-    // ── Notify bot OTP was sent ───────────────────────────────────────────
-    await sendWebhook('otp_requested');
-    console.log('[MAIN] OTP requested — waiting for user reply on Telegram (13 min)...');
-
-    // ── Poll for OTP ──────────────────────────────────────────────────────
-    const otp = await pollForOtp();
-    if (!otp) {
-      console.log('[MAIN] OTP timed out');
-      process.exit(0);
-    }
-
-    console.log(`[MAIN] Entering OTP: ${otp}`);
-
-    // Clear any existing digits and enter OTP
-    // WhatsApp OTP screen usually has 6 individual boxes or one field
-    keyevent('KEYCODE_CTRL_A');
-    await WAIT_MS(200);
-    keyevent('KEYCODE_DEL');
-    await WAIT_MS(200);
-
-    // Type digit by digit with small delay (works for both single field and boxes)
-    for (const digit of otp) {
-      typeText(digit);
-      await WAIT_MS(300);
-    }
-    await WAIT_MS(4000);
-
-    // ── Check OTP result ──────────────────────────────────────────────────
-    const resultXml = await dumpUI();
-    console.log('[MAIN] OTP result screen:');
-    await getCurrentScreen();
-
-    if (resultXml.includes('Wrong code') || resultXml.includes('wrong code') ||
-        resultXml.includes('incorrect') || resultXml.includes('Invalid code')) {
-      await sendWebhook('otp_error');
-      process.exit(0);
-    }
-
-    if (resultXml.includes('two-step') || resultXml.includes('Two-step') ||
-        resultXml.includes('passkey') || resultXml.includes('Passkey') ||
-        resultXml.includes('fingerprint') || resultXml.includes('2FA')) {
-      await sendWebhook('bad_number', { reason: '2FA/passkey required' });
-      process.exit(0);
-    }
-
-    // ── Skip optional setup screens ───────────────────────────────────────
-    for (let i = 0; i < 5; i++) {
-      const xml = await dumpUI(3000);
-      let skipped = false;
-      for (const skipText of ['Skip', 'Not now', 'Continue', 'Allow', 'SKIP', 'Later']) {
-        if (xml && xml.includes(skipText)) {
-          await tapText(skipText, 5000);
-          await WAIT_MS(2000);
-          skipped = true;
-          break;
-        }
-      }
-      if (!skipped) break;
-    }
-
-    // ── Success ───────────────────────────────────────────────────────────
-    await sendWebhook('registered');
-    console.log(`[MAIN] ${PHONE} registered successfully`);
-    process.exit(0);
-
-  } catch (err) {
-    console.error('[MAIN] Fatal error:', err.message);
-    console.error(err.stack);
-    await sendWebhook('bad_number', { reason: `Script error: ${err.message}` });
-    process.exit(0); // exit(0) — bot already notified, skip if:failure() step
+  // ── 1. Verify emulator is ready ─────────────────────────────────────────
+  await sleep(3000);
+  const bootProp = adbShell('getprop sys.boot_completed');
+  if (bootProp.trim() !== '1') {
+    throw new Error(`Emulator not ready — boot_completed=${bootProp}`);
   }
+  log('MAIN', 'Emulator ready');
+
+  // ── 2. Unlock screen ────────────────────────────────────────────────────
+  await unlockScreen();
+
+  // ── 3. Install WhatsApp ──────────────────────────────────────────────────
+  await installWhatsApp();
+  log('MAIN', 'WhatsApp installed');
+
+  // ── 4. Launch WhatsApp ───────────────────────────────────────────────────
+  log('MAIN', 'Launching WhatsApp...');
+  keyevent('KEYCODE_HOME');
+  await sleep(500);
+  adbShell(`am start -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
+  await sleep(5000);
+  await logScreen('LAUNCH');
+
+  // ── 5. Accept terms ──────────────────────────────────────────────────────
+  const agreeResult = await waitForAny(
+    ['AGREE AND CONTINUE', 'Agree and continue', 'Accept', 'I agree', 'AGREE'],
+    20000
+  );
+  if (agreeResult.matched) {
+    await tapElement(agreeResult.matched, agreeResult.xml);
+    await sleep(3000);
+    await logScreen('POST-AGREE');
+  }
+
+  // ── 6. Phone number entry ────────────────────────────────────────────────
+  log('MAIN', 'Waiting for phone number screen...');
+  const phoneResult = await waitForAny([
+    'Enter your phone number',
+    'Your phone number',
+    'Phone number',
+    'phone number',
+    'Country',
+    'country code',
+  ], 60000);
+
+  if (!phoneResult.matched) {
+    await logScreen('ERROR');
+    await webhook('bad_number', { reason: 'Phone entry screen not found' });
+    process.exit(0);
+  }
+
+  log('MAIN', `Phone screen found: "${phoneResult.matched}"`);
+  await sleep(1000);
+
+  // Clear any pre-filled field and enter the number
+  keyevent('KEYCODE_CTRL_A');
+  await sleep(200);
+  keyevent('KEYCODE_DEL');
+  await sleep(200);
+  typeText(PHONE);
+  await sleep(1000);
+  await logScreen('AFTER-TYPE');
+
+  // Tap Next
+  const nextResult = await waitForAny(['Next', 'NEXT', 'Done', 'Continue'], 10000);
+  if (nextResult.matched) {
+    await tapElement(nextResult.matched, nextResult.xml);
+  } else {
+    // Fallback — tap top-right corner where Next usually is on Pixel 4
+    log('MAIN', 'Next button not found — tapping coordinate fallback');
+    tap(978, 184);
+  }
+  await sleep(4000);
+  await logScreen('AFTER-NEXT');
+
+  // ── 7. Check post-Next screen ────────────────────────────────────────────
+  const postNext = await dumpUI();
+  const postNextLower = postNext.toLowerCase();
+
+  if (postNextLower.includes('try again') || postNextLower.includes('wait')) {
+    const secs = parseWaitSeconds(postNext);
+    log('MAIN', `Rate limited — ${secs}s`);
+    await webhook('rate_limited', { wait_seconds: secs });
+    process.exit(0);
+  }
+
+  if (postNextLower.includes('not a valid') || postNextLower.includes('invalid') ||
+      postNextLower.includes('enter a valid')) {
+    await webhook('bad_number', { reason: 'WhatsApp: invalid phone number' });
+    process.exit(0);
+  }
+
+  if (postNextLower.includes('already have an account') ||
+      postNextLower.includes('welcome back')) {
+    await webhook('already_registered');
+    process.exit(0);
+  }
+
+  // ── 8. Confirm SMS send ──────────────────────────────────────────────────
+  // WhatsApp shows a dialog confirming the number before sending OTP
+  const confirmResult = await waitForAny(['OK', 'Send SMS', 'SEND SMS', 'Yes', 'Confirm'], 15000);
+  if (confirmResult.matched) {
+    log('MAIN', `Confirming: "${confirmResult.matched}"`);
+    await tapElement(confirmResult.matched, confirmResult.xml);
+    await sleep(3000);
+  }
+
+  // ── 9. Wait for OTP screen ───────────────────────────────────────────────
+  log('MAIN', 'Waiting for OTP screen...');
+  const otpScreenResult = await waitForAny([
+    'Enter the 6-digit code',
+    'Enter code',
+    'Verifying',
+    'Didn\'t receive',
+    'Resend SMS',
+    'resend',
+    'code sent',
+  ], 45000);
+
+  if (!otpScreenResult.matched) {
+    await logScreen('ERROR');
+    await webhook('bad_number', { reason: 'OTP screen not reached' });
+    process.exit(0);
+  }
+
+  log('MAIN', `OTP screen: "${otpScreenResult.matched}"`);
+
+  // ── 10. Notify bot OTP was sent ──────────────────────────────────────────
+  await webhook('otp_requested');
+  log('MAIN', 'Notified bot — waiting for OTP from Telegram user...');
+
+  // ── 11. Poll for OTP ─────────────────────────────────────────────────────
+  const otp = await pollForOtp();
+  if (!otp) {
+    log('MAIN', 'OTP wait timed out');
+    process.exit(0);
+  }
+
+  log('MAIN', `Submitting OTP: ${otp}`);
+
+  // Clear any partial entry then type digit by digit
+  keyevent('KEYCODE_CTRL_A');
+  await sleep(300);
+  keyevent('KEYCODE_DEL');
+  await sleep(300);
+  typeDigits(otp);
+  await sleep(5000);
+
+  // ── 12. Check OTP result ─────────────────────────────────────────────────
+  const resultXml = await dumpUI();
+  const resultLower = resultXml.toLowerCase();
+  await logScreen('OTP-RESULT');
+
+  if (resultLower.includes('wrong code') || resultLower.includes('incorrect') ||
+      resultLower.includes('invalid code')) {
+    await webhook('otp_error');
+    process.exit(0);
+  }
+
+  if (resultLower.includes('two-step') || resultLower.includes('passkey') ||
+      resultLower.includes('fingerprint') || resultLower.includes('2fa')) {
+    await webhook('bad_number', { reason: '2FA or passkey required' });
+    process.exit(0);
+  }
+
+  // ── 13. Skip optional post-registration screens ──────────────────────────
+  for (let i = 0; i < 6; i++) {
+    const skipResult = await waitForAny(
+      ['Skip', 'SKIP', 'Not now', 'Continue', 'Allow', 'Later', 'OK'],
+      5000
+    );
+    if (!skipResult.matched) break;
+    await tapElement(skipResult.matched, skipResult.xml);
+    await sleep(1500);
+  }
+
+  // ── 14. Done ─────────────────────────────────────────────────────────────
+  await webhook('registered');
+  log('MAIN', `${PHONE} registered successfully`);
+  process.exit(0);
 }
 
-main();
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+main().catch(async (err) => {
+  log('ERROR', err.message);
+  log('ERROR', err.stack);
+  await webhook('bad_number', { reason: `Script error: ${err.message}` });
+  process.exit(0); // exit 0 — bot already notified, skip if:failure() step
+});
