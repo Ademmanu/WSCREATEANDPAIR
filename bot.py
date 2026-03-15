@@ -312,7 +312,7 @@ async def webhook_handler(request: web.Request) -> web.Response:
     chat_id = user_id  # Telegram user_id == chat_id for private chats
 
     # ── OTP requested (send second Processing message) ──────────────────────
-    if event == "otp_requested":
+    if event == "otp_requested" or event == "awaiting_otp":
         otp_msg_id = await send_processing(bot, chat_id, phone)
         expires = datetime.now(timezone.utc) + timedelta(minutes=15)
         await db.upsert_registration(
@@ -328,7 +328,7 @@ async def webhook_handler(request: web.Request) -> web.Response:
         )
 
     # ── Registered successfully ──────────────────────────────────────────────
-    elif event == "registered":
+    elif event == "registered" or event == "success":
         _cancel_otp_timer(user_id, phone)
         otp_msg_id = reg.get("otp_message_id") or reg.get("first_message_id")
         before = utils.msg_processing(phone)
@@ -336,9 +336,16 @@ async def webhook_handler(request: web.Request) -> web.Response:
         await edit_message_logged(bot, chat_id, otp_msg_id, before, after,
                                    phone, user_id, "OTP accepted, WhatsApp registration complete")
         await db.update_status(user_id, phone, "REGISTERED")
+        
+        # Store session data if provided
+        if "session" in data:
+            await db.upsert_registration(
+                user_id, phone,
+                session_data=data["session"],
+            )
 
     # ── OTP wrong ────────────────────────────────────────────────────────────
-    elif event == "otp_error":
+    elif event == "otp_error" or event == "error_code":
         otp_msg_id = reg.get("otp_message_id")
         if otp_msg_id:
             before = utils.msg_processing(phone)
@@ -346,6 +353,16 @@ async def webhook_handler(request: web.Request) -> web.Response:
             await edit_message_logged(bot, chat_id, otp_msg_id, before, after,
                                        phone, user_id, "Invalid OTP entered")
             await db.update_status(user_id, phone, "ERROR_CODE")
+    
+    # ── OTP timeout ──────────────────────────────────────────────────────────
+    elif event == "timeout":
+        _cancel_otp_timer(user_id, phone)
+        msg_id = reg.get("otp_message_id") or reg.get("first_message_id")
+        before = utils.msg_processing(phone)
+        after = utils.msg_try_in(phone, 600)
+        await edit_message_logged(bot, chat_id, msg_id, before, after,
+                                   phone, user_id, "OTP timeout — user did not reply")
+        await db.update_status(user_id, phone, "TIMEOUT")
 
     # ── Already registered ───────────────────────────────────────────────────
     elif event == "already_registered":
@@ -440,14 +457,18 @@ async def webhook_handler(request: web.Request) -> web.Response:
 
 async def otp_poll_handler(request: web.Request) -> web.Response:
     """Called by wa_register.js to retrieve the OTP once the user replies on Telegram."""
-    secret = request.headers.get("X-Webhook-Secret", "")
-    if not _verify_secret(secret):
-        return web.Response(status=403, text="Forbidden")
+    # Check API key instead of webhook secret for internal endpoints
+    api_key = request.headers.get("X-API-Key", "")
+    if api_key != INTERNAL_API_KEY:
+        return web.json_response({"error": "Forbidden"}, status=403)
+    
     phone = request.match_info.get("phone", "")
+    if not phone:
+        return web.json_response({"error": "Phone number required"}, status=400)
+    
     otp = await otp_store.get_and_clear(phone)
-    if otp:
-        return web.Response(status=200, text=otp)
-    return web.Response(status=204, text="")  # not ready yet
+    
+    return web.json_response({"otp": otp})
 
 
 async def health_handler(request: web.Request) -> web.Response:
