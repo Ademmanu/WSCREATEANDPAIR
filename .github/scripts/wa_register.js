@@ -404,17 +404,13 @@ async function main() {
   await installWhatsApp();
   log('MAIN', 'WhatsApp installed');
 
-  // ── 4. Launch WhatsApp ───────────────────────────────────────────────────
-  log('MAIN', 'Launching WhatsApp...');
+  // ── 4. Grant permissions & Launch WhatsApp ──────────────────────────────
+  log('MAIN', 'Granting permissions and launching WhatsApp...');
 
-  // Dismiss any pending system dialogs (Google Play updates etc.)
-  keyevent('KEYCODE_BACK');
-  await sleep(300);
   keyevent('KEYCODE_HOME');
   await sleep(1000);
 
-  // Grant WhatsApp permissions upfront so it does not show permission dialogs
-  for (const perm of [
+  const WA_PERMS = [
     'android.permission.READ_CONTACTS',
     'android.permission.WRITE_CONTACTS',
     'android.permission.READ_PHONE_STATE',
@@ -426,68 +422,48 @@ async function main() {
     'android.permission.RECEIVE_SMS',
     'android.permission.READ_SMS',
     'android.permission.SEND_SMS',
-  ]) {
+    'android.permission.GET_ACCOUNTS',
+  ];
+  for (const perm of WA_PERMS) {
     adbShell(`pm grant ${WA_PACKAGE} ${perm} 2>/dev/null || true`);
   }
   log('MAIN', 'Permissions granted');
-  await sleep(500);
 
-  // Launch using am start with FLAG_ACTIVITY_NEW_TASK to force foreground
-  adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main --activity-clear-top 2>/dev/null || am start -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
-  log('MAIN', 'am start sent — waiting for WhatsApp to render...');
-  await sleep(8000);
+  // monkey sends INTENT_ACTION_MAIN + CATEGORY_LAUNCHER — identical to tapping the icon
+  // This is the most reliable foreground launch method on Android emulators
+  adbShell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1 2>/dev/null`);
+  log('MAIN', 'Launched via monkey — waiting 10s for WhatsApp to render...');
+  await sleep(10000);
   await logScreen('LAUNCH');
 
-  // Check what happened after launch
   const launchTexts = await screenTexts();
-  const onHomeScreen = launchTexts.some(t =>
-    t.includes('Messages') || t.includes('Chrome') ||
-    ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday']
-      .some(d => t.includes(d))
+  const isHomeScreen = launchTexts.some(t =>
+    ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday',
+     'Messages','Chrome','Camera'].some(w => t.includes(w))
   );
   const isCrashing = launchTexts.some(t => t.includes('keeps stopping'));
 
-  // Capture logcat immediately to see what WhatsApp is doing
-  const logcat = adbShell('logcat -d -t 80 *:E 2>/dev/null | tail -40');
-  log('LOGCAT', logcat || '(empty)');
-
   if (isCrashing) {
-    // Dismiss crash dialog
-    log('MAIN', 'Crash dialog detected — dismissing and checking logcat...');
+    log('MAIN', 'Crash — dismissing, clearing data, relaunching...');
     const crashXml = await dumpUI();
     await tapElement('Close app', crashXml);
     await sleep(2000);
-
-    // Check if a specific error is visible
-    const errorXml = await dumpUI();
-    log('CRASH-SCREEN', errorXml.substring(0, 500));
-
-    // Try clearing app data and relaunching fresh
-    log('MAIN', 'Clearing WhatsApp data and relaunching...');
     adbShell(`pm clear ${WA_PACKAGE} 2>/dev/null || true`);
-    await sleep(2000);
-
-    // Re-grant permissions after clear
-    for (const perm of [
-      'android.permission.READ_CONTACTS','android.permission.WRITE_CONTACTS',
-      'android.permission.READ_PHONE_STATE','android.permission.RECEIVE_SMS',
-      'android.permission.READ_SMS','android.permission.SEND_SMS',
-      'android.permission.CAMERA','android.permission.RECORD_AUDIO',
-      'android.permission.READ_EXTERNAL_STORAGE','android.permission.WRITE_EXTERNAL_STORAGE',
-    ]) {
+    await sleep(1000);
+    for (const perm of WA_PERMS) {
       adbShell(`pm grant ${WA_PACKAGE} ${perm} 2>/dev/null || true`);
     }
+    adbShell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1 2>/dev/null`);
+    await sleep(12000);
+    await logScreen('AFTER-CLEAR');
 
-    adbShell(`am start -W -n ${WA_PACKAGE}/${WA_PACKAGE}.Main`);
-    await sleep(10000);
-    await logScreen('RELAUNCH');
-
-  } else if (onHomeScreen) {
-    // WhatsApp started but didn't come to foreground — just wait longer
-    log('MAIN', 'WhatsApp on home screen — waiting longer for it to surface...');
+  } else if (isHomeScreen) {
+    log('MAIN', 'Still home screen — trying am start fallback...');
+    adbShell(`am start -n ${WA_PACKAGE}/${WA_PACKAGE}.Main 2>/dev/null`);
     await sleep(8000);
-    await logScreen('RELAUNCH');
+    await logScreen('AFTER-AMSTART');
   }
+
 
   // ── 5. Accept terms ──────────────────────────────────────────────────────
   // Wait up to 30s for WhatsApp agree screen — also handle Google dialogs
