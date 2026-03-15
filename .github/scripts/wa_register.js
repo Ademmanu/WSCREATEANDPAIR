@@ -19,6 +19,7 @@ const https         = require('https');
 const http          = require('http');
 const fs            = require('fs');
 const path          = require('path');
+const { parsePhoneNumber, isValidPhoneNumber } = require('libphonenumber-js');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -31,6 +32,58 @@ const RENDER_BASE    = WEBHOOK_URL.replace('/webhook/event', '');
 const WA_PACKAGE     = 'com.whatsapp';
 const APK_PATH       = '/tmp/whatsapp.apk';
 const SCRIPT_DIR     = '/tmp/wa_scripts';
+
+// ── Phone number parsing ──────────────────────────────────────────────────────
+
+/**
+ * Parse a full international number like "2348012345678" into:
+ *   { countryCode: '234', nationalNumber: '8012345678', country: 'NG' }
+ *
+ * libphonenumber-js requires a + prefix for E.164 parsing.
+ * We try with + prefix first, then brute-force country code matching
+ * as a fallback for numbers the library can't auto-detect.
+ */
+function parsePhone(fullNumber) {
+  const withPlus = `+${fullNumber}`;
+  try {
+    if (isValidPhoneNumber(withPlus)) {
+      const parsed = parsePhoneNumber(withPlus);
+      return {
+        countryCode: String(parsed.countryCallingCode),
+        nationalNumber: parsed.nationalNumber,
+        country: parsed.country || 'unknown',
+      };
+    }
+  } catch (_) {}
+
+  // Fallback: try common country code lengths (1, 2, 3 digits)
+  // Sorted by length descending so 3-digit codes match before 1-digit
+  const cc3 = fullNumber.substring(0, 3);
+  const cc2 = fullNumber.substring(0, 2);
+  const cc1 = fullNumber.substring(0, 1);
+
+  for (const cc of [cc3, cc2, cc1]) {
+    try {
+      const national = fullNumber.substring(cc.length);
+      const attempt = `+${cc}${national}`;
+      if (isValidPhoneNumber(attempt)) {
+        const parsed = parsePhoneNumber(attempt);
+        return {
+          countryCode: String(parsed.countryCallingCode),
+          nationalNumber: parsed.nationalNumber,
+          country: parsed.country || 'unknown',
+        };
+      }
+    } catch (_) {}
+  }
+
+  // Last resort: assume first 3 digits are country code
+  return {
+    countryCode: fullNumber.substring(0, 3),
+    nationalNumber: fullNumber.substring(3),
+    country: 'unknown',
+  };
+}
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -388,6 +441,10 @@ async function unlockScreen() {
 
 async function main() {
   log('MAIN', `Starting registration for ${PHONE}`);
+
+  // ── Parse phone number into country code + national number ───────────────
+  const phoneInfo = parsePhone(PHONE);
+  log('MAIN', `Parsed: country=${phoneInfo.country} cc=${phoneInfo.countryCode} national=${phoneInfo.nationalNumber}`);
 
   // ── 1. Verify emulator is ready ─────────────────────────────────────────
   await sleep(3000);
