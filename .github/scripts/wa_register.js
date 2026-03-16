@@ -532,6 +532,10 @@ async function tapElement(text, screen = null, retries = 3) {
         log('TAP_ELEMENT', `"${text}" → (${element.center.x}, ${element.center.y})`);
         tap(element.center.x, element.center.y);
         await sleep(800);
+        
+        // Log screen after tap
+        await logScreen(`AFTER_TAP_${text.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`);
+        
         return true;
       }
     }
@@ -571,6 +575,9 @@ async function fillInputField(labelText, value, screen = null) {
       log('FILL_INPUT', `Entering: ${value}`);
       typeDigits(value);
       await sleep(500);
+      
+      // Log screen after filling
+      await logScreen('AFTER_FILL_INPUT');
       
       return true;
     }
@@ -893,7 +900,12 @@ async function main() {
           await tapElement('Not now', screen) ||
           await tapElement('Cancel', screen) ||
           await tapElement('Close', screen);
-        if (!dismissed) tap(540, 1200);
+        if (!dismissed) {
+          log('MAIN', 'Fallback center tap for alert dialog');
+          tap(540, 1200);
+          await sleep(500);
+          await logScreen('AFTER_ALERT_FALLBACK_TAP');
+        }
         await sleep(2000);
       } else {
         break;
@@ -901,26 +913,14 @@ async function main() {
     }
   }
 
-  // ── 6. Handle language selection screen ──────────────────────────────────
-  const langScreen = await dumpUI(4000);
-  if (langScreen) {
-    const langTexts = langScreen.getAllText();
-    if (langTexts.some(t => t.includes('Choose your language') || t.includes('Welcome to WhatsApp'))) {
-      log('MAIN', 'Language screen detected — tapping next/continue');
-      const arrowTapped =
-        await tapElement('next', langScreen) ||
-        await tapElement('Next', langScreen) ||
-        await tapElement('Continue', langScreen);
-      if (!arrowTapped) tap(108, 2100);
-      await sleep(3000);
-    }
-  }
+  // ── 6. Language screen is auto-handled (AGREE button is visible at launch)
+  // No need for separate language screen detection
 
   // ── 7. Accept terms and conditions ───────────────────────────────────────
   log('MAIN', 'Waiting for terms screen...');
   const agreeResult = await waitForAny([
     'AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree',
-  ], 30000);
+  ], 10000);
 
   if (agreeResult.matched) {
     log('MAIN', `Terms screen found: "${agreeResult.matched}"`);
@@ -946,7 +946,7 @@ async function main() {
     'What\'s your number',
     'Enter phone number',
     'Your phone number',
-  ], 30000);
+  ], 20000);
 
   if (!phoneScreenResult.matched) {
     const currentTexts = await screenTexts();
@@ -1141,6 +1141,7 @@ async function main() {
       log('MAIN', 'Using fallback OTP entry method');
       tap(540, 1000);
       await sleep(500);
+      await logScreen('AFTER_OTP_FALLBACK_TAP');
       typeDigits(otp);
       await sleep(1000);
     }
@@ -1174,7 +1175,7 @@ async function main() {
       'Wrong code',
       'Incorrect',
       'Try again',
-    ], 30000);
+    ], 10000);
 
     if (!resultWait.matched) {
       await logScreen('POST_OTP_UNKNOWN');
