@@ -939,14 +939,14 @@ async function main() {
   }
 
   // ── 8. Wait for phone number entry screen ────────────────────────────────
-  log('MAIN', 'Waiting for phone number screen...');
+  log('MAIN', 'Waiting for phone number screen (5s)...');
   const phoneScreenResult = await waitForAny([
     'Enter your phone number',
     'Phone number',
     'What\'s your number',
     'Enter phone number',
     'Your phone number',
-  ], 20000);
+  ], 5000);
 
   if (!phoneScreenResult.matched) {
     const currentTexts = await screenTexts();
@@ -973,63 +973,88 @@ async function main() {
     throw new Error('Failed to analyze phone screen');
   }
 
-  // ── 9. Handle country code selection ─────────────────────────────────────
-  log('MAIN', 'Looking for country code field...');
+  // ── 9. Select country ────────────────────────────────────────────────────
+  log('MAIN', 'Tapping country selector (United States)...');
   
-  const countryPickerTapped = 
-    await tapElement('Country', phoneScreen) ||
-    await tapElement('Select country', phoneScreen) ||
-    await tapElement(phoneInfo.country, phoneScreen);
-
-  if (countryPickerTapped) {
-    await sleep(2000);
-    log('MAIN', 'Country picker opened');
+  // Tap the country name to open picker
+  const countryTapped = await tapElement('United States', phoneScreen);
+  
+  if (countryTapped) {
+    // Wait for "Choose a country" screen (5s)
+    log('MAIN', 'Waiting for country picker screen...');
+    const pickerScreen = await waitForScreen('Choose a country', 5000);
     
-    let searchScreen = await dumpUI();
-    const searchTapped = 
-      await tapElement('Search', searchScreen) ||
-      await tapElement('Search countries', searchScreen);
-    
-    if (searchTapped) {
-      await sleep(1000);
-      typeDigits(phoneInfo.countryCode);
-      await sleep(2000);
+    if (pickerScreen) {
+      log('MAIN', 'Country picker opened');
       
-      keyevent('KEYCODE_DPAD_DOWN');
-      await sleep(300);
-      keyevent('KEYCODE_ENTER');
-      await sleep(1500);
-    } else {
-      searchScreen = await dumpUI();
-      const ccTapped = await tapElement(`+${phoneInfo.countryCode}`, searchScreen);
-      if (!ccTapped) {
-        await tapElement(phoneInfo.country, searchScreen);
+      // Tap search icon to open search field
+      log('MAIN', 'Tapping search icon...');
+      const searchTapped = await tapElement('Search', pickerScreen, 1);
+      
+      if (searchTapped) {
+        // Wait for "Search countries" screen (5s)
+        log('MAIN', 'Waiting for search countries screen...');
+        await sleep(2000);
+        
+        // Type country code in search field
+        log('MAIN', `Typing country code: ${phoneInfo.countryCode}`);
+        typeDigits(phoneInfo.countryCode);
+        await sleep(2000);
+        
+        // Wait for country result to appear (10s)
+        log('MAIN', `Waiting for country result with code +${phoneInfo.countryCode}...`);
+        const countryResultScreen = await waitForScreen(`+${phoneInfo.countryCode}`, 10000);
+        
+        if (countryResultScreen) {
+          // Tap the country result
+          log('MAIN', `Tapping country result: +${phoneInfo.countryCode}`);
+          await tapElement(`+${phoneInfo.countryCode}`, countryResultScreen, 1);
+          
+          // Wait to return to phone number screen (10s)
+          log('MAIN', 'Waiting for phone number screen to return...');
+          await waitForScreen('Phone number', 10000);
+        } else {
+          log('MAIN', 'Country result not found - using fallback');
+          keyevent('KEYCODE_DPAD_DOWN');
+          await sleep(300);
+          keyevent('KEYCODE_ENTER');
+          await sleep(2000);
+        }
       }
-      await sleep(1500);
     }
-  } else {
-    log('MAIN', 'Country picker not found - may already be selected');
   }
 
-  // ── 10. Enter phone number ───────────────────────────────────────────────
-  log('MAIN', 'Entering phone number...');
+  // ── 10. Enter national phone number ──────────────────────────────────────
+  log('MAIN', 'Entering national phone number...');
+  
+  // Get fresh screen state
   let numberEntryScreen = await dumpUI();
   
-  const filled = await fillInputField('Phone number', phoneInfo.nationalNumber, numberEntryScreen);
-  
-  if (!filled) {
-    log('MAIN', 'Using fallback method to enter phone number');
-    numberEntryScreen = await dumpUI();
-    if (numberEntryScreen) {
-      const editFields = numberEntryScreen.getEditableFields();
-      if (editFields.length > 0 && editFields[0].center) {
-        tap(editFields[0].center.x, editFields[0].center.y);
-        await sleep(500);
-        typeDigits(phoneInfo.nationalNumber);
-        await sleep(1000);
-      } else {
-        throw new Error('Could not find phone number input field');
+  if (numberEntryScreen) {
+    const editFields = numberEntryScreen.getEditableFields();
+    
+    // We need the SECOND EditText field (phone number), not the first (country code)
+    if (editFields.length >= 2) {
+      const phoneField = editFields[1]; // Second field is phone number
+      log('MAIN', `Phone number field found at (${phoneField.center.x}, ${phoneField.center.y})`);
+      
+      // Tap phone number field
+      tap(phoneField.center.x, phoneField.center.y);
+      await sleep(500);
+      
+      // Clear any existing text
+      for (let i = 0; i < 20; i++) {
+        keyevent('KEYCODE_DEL');
       }
+      await sleep(300);
+      
+      // Enter national number
+      log('MAIN', `Typing national number: ${phoneInfo.nationalNumber}`);
+      typeDigits(phoneInfo.nationalNumber);
+      await sleep(1000);
+      await logScreen('AFTER_PHONE_NUMBER_ENTRY');
+    } else {
+      throw new Error('Could not find phone number input field');
     }
   }
 
@@ -1074,22 +1099,23 @@ async function main() {
   }
 
   // ── 13. Wait for OTP screen or handle errors ─────────────────────────────
-  log('MAIN', 'Waiting for OTP screen or error messages...');
+  log('MAIN', 'Waiting for OTP screen or error messages (60s)...');
   
   const otpOrErrorResult = await waitForAny([
-    'Verify',
-    'Enter the code',
-    'verification code',
+    'Verifying',
+    'Enter the 6-digit code',
+    'Enter code',
+    'verification code we',
     '6-digit code',
     'We sent',
-    'SMS',
+    'Didn\'t get the code',
     'number is not allowed',
     'Too many attempts',
     'This phone number is already registered',
     'temporarily blocked',
-    'try again',
+    'try again later',
     'wait',
-  ], 45000);
+  ], 60000);
 
   if (!otpOrErrorResult.matched) {
     await logScreen('UNKNOWN_SCREEN');
@@ -1113,8 +1139,14 @@ async function main() {
     return;
   }
 
-  if (matchedLower.includes('verify') || matchedLower.includes('code') || 
-      matchedLower.includes('sms') || matchedLower.includes('sent')) {
+  // Check for OTP screen - must have "code" or "sent" and NOT "verify your phone number"
+  const isOtpScreen = (
+    (matchedLower.includes('code') || matchedLower.includes('sent') || 
+     matchedLower.includes('verifying') || matchedLower.includes('didn\'t get')) &&
+    !matchedLower.includes('verify your phone number')
+  );
+
+  if (isOtpScreen) {
     log('MAIN', 'OTP screen detected');
     await logScreen('OTP_SCREEN');
     
