@@ -856,6 +856,27 @@ async function main() {
   log('MAIN', 'Launched via monkey — waiting 10s for WhatsApp to render...');
   await sleep(10000);
   await logScreen('LAUNCH');
+  
+  // Test if screen is interactive
+  log('MAIN', 'Testing if screen is interactive...');
+  const testScreen1 = await dumpUI();
+  const testXml1 = testScreen1 ? testScreen1.xml : '';
+  
+  // Tap a safe area (middle of screen)
+  tap(540, 1000);
+  await sleep(1000);
+  
+  const testScreen2 = await dumpUI();
+  const testXml2 = testScreen2 ? testScreen2.xml : '';
+  
+  const screenResponsive = testXml1 !== testXml2;
+  log('MAIN', `Screen appears responsive to taps: ${screenResponsive}`);
+  
+  if (!screenResponsive) {
+    log('MAIN', 'Screen may not be fully loaded yet - waiting additional 5s...');
+    await sleep(5000);
+    await logScreen('AFTER_ADDITIONAL_WAIT');
+  }
 
   const launchTexts = await screenTexts();
   const isHomeScreen = launchTexts.some(t =>
@@ -976,12 +997,53 @@ async function main() {
   // ── 9. Select country ────────────────────────────────────────────────────
   log('MAIN', 'Tapping country selector (United States)...');
   
-  // Tap the country name to open picker
-  const countryTapped = await tapElement('United States', phoneScreen);
+  // Get UI state BEFORE tap
+  const beforeTapScreen = await dumpUI();
+  const beforeTapXml = beforeTapScreen ? beforeTapScreen.xml : '';
   
-  if (countryTapped) {
+  // Tap the country name to open picker
+  const countryElement = beforeTapScreen.findByText('United States')[0];
+  if (countryElement && countryElement.center) {
+    log('MAIN', `Country element found at (${countryElement.center.x}, ${countryElement.center.y})`);
+    log('MAIN', `Element class: ${countryElement.className}`);
+    log('MAIN', `Element clickable: ${countryElement.clickable}`);
+    log('MAIN', `Element enabled: ${countryElement.enabled}`);
+    
+    tap(countryElement.center.x, countryElement.center.y);
+    await sleep(2000);
+    
+    // Get UI state AFTER tap
+    const afterTapScreen = await dumpUI();
+    const afterTapXml = afterTapScreen ? afterTapScreen.xml : '';
+    
+    // Compare XMLs to see if screen actually changed
+    const screenChanged = beforeTapXml !== afterTapXml;
+    log('MAIN', `Screen changed after tap: ${screenChanged}`);
+    
+    if (!screenChanged) {
+      log('MAIN', 'Screen did NOT change! Trying alternative methods...');
+      
+      // Try tapping slightly offset
+      log('MAIN', 'Trying offset tap...');
+      tap(countryElement.center.x, countryElement.center.y + 20);
+      await sleep(2000);
+      
+      // Try tapping the resource ID area
+      log('MAIN', 'Trying bounds-based tap...');
+      const bounds = countryElement.bounds;
+      tap(bounds.x1 + 100, bounds.y1 + 30); // Top-left area
+      await sleep(2000);
+      
+      // Check again
+      const afterRetryScreen = await dumpUI();
+      const retryChanged = afterTapXml !== (afterRetryScreen ? afterRetryScreen.xml : '');
+      log('MAIN', `Screen changed after retry: ${retryChanged}`);
+    }
+    
+    await logScreen('AFTER_COUNTRY_TAP_ATTEMPT');
+    
     // Wait for "Choose a country" screen (5s)
-    log('MAIN', 'Waiting for country picker screen...');
+    log('MAIN', 'Waiting for country picker dialog...');
     const pickerScreen = await waitForScreen('Choose a country', 5000);
     
     if (pickerScreen) {
@@ -1037,21 +1099,73 @@ async function main() {
     if (editFields.length >= 2) {
       const phoneField = editFields[1]; // Second field is phone number
       log('MAIN', `Phone number field found at (${phoneField.center.x}, ${phoneField.center.y})`);
+      log('MAIN', `Phone field class: ${phoneField.className}`);
+      log('MAIN', `Phone field enabled: ${phoneField.enabled}`);
+      log('MAIN', `Phone field focusable: ${phoneField.focusable}`);
+      
+      // Get XML before tap
+      const beforePhoneXml = numberEntryScreen.xml;
       
       // Tap phone number field
       tap(phoneField.center.x, phoneField.center.y);
-      await sleep(500);
+      await sleep(1000);
+      
+      // Check if field is now focused
+      const afterFocusScreen = await dumpUI();
+      const focusChanged = beforePhoneXml !== (afterFocusScreen ? afterFocusScreen.xml : '');
+      log('MAIN', `Field focus changed: ${focusChanged}`);
+      
+      if (afterFocusScreen) {
+        const focusedFields = afterFocusScreen.getEditableFields();
+        if (focusedFields.length >= 2) {
+          const nowFocused = focusedFields[1].focused;
+          log('MAIN', `Phone field focused state: ${nowFocused}`);
+        }
+      }
       
       // Clear any existing text
+      log('MAIN', 'Clearing field...');
       for (let i = 0; i < 20; i++) {
         keyevent('KEYCODE_DEL');
       }
-      await sleep(300);
+      await sleep(500);
+      
+      // Get XML before typing
+      const beforeTypeScreen = await dumpUI();
+      const beforeTypeXml = beforeTypeScreen ? beforeTypeScreen.xml : '';
       
       // Enter national number
       log('MAIN', `Typing national number: ${phoneInfo.nationalNumber}`);
       typeDigits(phoneInfo.nationalNumber);
-      await sleep(1000);
+      await sleep(1500);
+      
+      // Get XML after typing
+      const afterTypeScreen = await dumpUI();
+      const afterTypeXml = afterTypeScreen ? afterTypeScreen.xml : '';
+      
+      // Check if anything changed
+      const typingChanged = beforeTypeXml !== afterTypeXml;
+      log('MAIN', `Screen changed after typing: ${typingChanged}`);
+      
+      // Check if the number appears in the text
+      const screenText = afterTypeScreen ? afterTypeScreen.getAllText().join(' ') : '';
+      const numberVisible = screenText.includes(phoneInfo.nationalNumber);
+      log('MAIN', `Phone number visible on screen: ${numberVisible}`);
+      
+      if (!numberVisible) {
+        log('MAIN', 'Number NOT visible! Trying alternative input method...');
+        
+        // Try using input text command instead of typeDigits
+        log('MAIN', 'Using adb input text...');
+        adbShell(`input text ${phoneInfo.nationalNumber}`);
+        await sleep(1500);
+        
+        const afterAltInputScreen = await dumpUI();
+        const altText = afterAltInputScreen ? afterAltInputScreen.getAllText().join(' ') : '';
+        const altVisible = altText.includes(phoneInfo.nationalNumber);
+        log('MAIN', `After alternative input, number visible: ${altVisible}`);
+      }
+      
       await logScreen('AFTER_PHONE_NUMBER_ENTRY');
     } else {
       throw new Error('Could not find phone number input field');
@@ -1064,18 +1178,71 @@ async function main() {
   log('MAIN', 'Looking for NEXT button...');
   let nextScreen = await dumpUI();
   
-  const nextTapped = 
-    await tapElement('NEXT', nextScreen) ||
-    await tapElement('Next', nextScreen) ||
-    await tapElement('Continue', nextScreen) ||
-    await tapElement('OK', nextScreen);
-
-  if (!nextTapped) {
-    throw new Error('Could not find NEXT button');
+  if (nextScreen) {
+    // Find NEXT button
+    const nextButtons = nextScreen.findByText('NEXT');
+    
+    if (nextButtons.length > 0) {
+      const nextBtn = nextButtons[0];
+      log('MAIN', `NEXT button found at (${nextBtn.center.x}, ${nextBtn.center.y})`);
+      log('MAIN', `NEXT button class: ${nextBtn.className}`);
+      log('MAIN', `NEXT button clickable: ${nextBtn.clickable}`);
+      log('MAIN', `NEXT button enabled: ${nextBtn.enabled}`);
+      log('MAIN', `NEXT button bounds: [${nextBtn.bounds.x1},${nextBtn.bounds.y1}][${nextBtn.bounds.x2},${nextBtn.bounds.y2}]`);
+      
+      // Get XML before tap
+      const beforeNextXml = nextScreen.xml;
+      
+      // Tap NEXT
+      tap(nextBtn.center.x, nextBtn.center.y);
+      await sleep(3000);
+      
+      // Get XML after tap
+      const afterNextScreen = await dumpUI();
+      const afterNextXml = afterNextScreen ? afterNextScreen.xml : '';
+      
+      // Compare
+      const nextChanged = beforeNextXml !== afterNextXml;
+      log('MAIN', `Screen changed after NEXT tap: ${nextChanged}`);
+      
+      if (!nextChanged) {
+        log('MAIN', 'NEXT button did NOT change screen! Checking why...');
+        
+        // Check if form is validated
+        const allText = afterNextScreen ? afterNextScreen.getAllText().join(' ') : '';
+        log('MAIN', `Current screen text: ${allText.substring(0, 200)}`);
+        
+        // Try tapping NEXT again with different method
+        log('MAIN', 'Trying alternative NEXT tap...');
+        keyevent('KEYCODE_ENTER'); // Try Enter key
+        await sleep(2000);
+        
+        const afterEnterScreen = await dumpUI();
+        const enterChanged = afterNextXml !== (afterEnterScreen ? afterEnterScreen.xml : '');
+        log('MAIN', `Screen changed after Enter key: ${enterChanged}`);
+        
+        if (!enterChanged) {
+          // Try swiping to dismiss keyboard if present
+          log('MAIN', 'Trying to dismiss keyboard...');
+          keyevent('KEYCODE_BACK');
+          await sleep(1000);
+          
+          // Try tapping NEXT again
+          const retryNextScreen = await dumpUI();
+          const retryNextButtons = retryNextScreen ? retryNextScreen.findByText('NEXT') : [];
+          if (retryNextButtons.length > 0) {
+            log('MAIN', 'Retapping NEXT after keyboard dismiss...');
+            tap(retryNextButtons[0].center.x, retryNextButtons[0].center.y);
+            await sleep(3000);
+          }
+        }
+      }
+      
+      await logScreen('AFTER_NEXT_TAP_ATTEMPT');
+    } else {
+      throw new Error('NEXT button not found');
+    }
   }
-
-  await sleep(3000);
-  await logScreen('AFTER_NEXT');
 
   // ── 12. Handle confirmation dialog ───────────────────────────────────────
   log('MAIN', 'Checking for confirmation dialog...');
