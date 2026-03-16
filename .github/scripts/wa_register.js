@@ -1,27 +1,36 @@
 /**
- * wa_register.js — WhatsApp registration automation via ADB
+ * wa_register.js — WhatsApp registration automation via ADB + UIAutomator XML
  *
  * Runs inside GitHub Actions after the Android emulator boots.
- * Installs WhatsApp, navigates the registration flow, requests OTP,
- * waits for the user to reply on Telegram, submits the OTP, and
- * reports the result back to the bot via webhook.
+ * Controls the emulator 100% via ADB commands — no Appium, no WebDriver.
+ *
+ * UI inspection pipeline:
+ *   1. adb shell uiautomator dump /sdcard/view.xml   → capture hierarchy on device
+ *   2. adb pull /sdcard/view.xml /tmp/view.xml        → transfer XML to host
+ *   3. fs.readFileSync('/tmp/view.xml')               → parse XML in Node.js
+ *   4. Extract bounds="[x1,y1][x2,y2]" → centre → adb shell input tap cx cy
+ *
+ * Registration flow:
+ *   boot-ready → install APK → launch WhatsApp → dismiss system dialogs →
+ *   agree terms → phone number screen (edit country code, enter national
+ *   number, tap NEXT) → confirm dialog → OTP → enter OTP → complete
  *
  * Required env vars:
- *   PHONE_NUMBER, TELEGRAM_USER_ID, WEBHOOK_URL,
- *   WEBHOOK_SECRET, GITHUB_RUN_ID
+ *   PHONE_NUMBER, TELEGRAM_USER_ID, WEBHOOK_URL, WEBHOOK_SECRET, GITHUB_RUN_ID
  */
 
 'use strict';
 
-const { execSync }  = require('child_process');
-const { execFile }  = require('child_process');
-const https         = require('https');
-const http          = require('http');
-const fs            = require('fs');
-const path          = require('path');
+const { execSync } = require('child_process');
+const https        = require('https');
+const http         = require('http');
+const fs           = require('fs');
+const path         = require('path');
 const { parsePhoneNumber, isValidPhoneNumber } = require('libphonenumber-js');
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────────────────────────────────────
 
 const PHONE          = process.env.PHONE_NUMBER;
 const USER_ID        = process.env.TELEGRAM_USER_ID;
@@ -29,63 +38,62 @@ const WEBHOOK_URL    = process.env.WEBHOOK_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const RUN_ID         = process.env.GITHUB_RUN_ID;
 const RENDER_BASE    = WEBHOOK_URL.replace('/webhook/event', '');
-const WA_PACKAGE     = 'com.whatsapp';
-const APK_PATH       = '/tmp/whatsapp.apk';
-const SCRIPT_DIR     = '/tmp/wa_scripts';
 
-// ── Phone number parsing ──────────────────────────────────────────────────────
+const WA_PACKAGE = 'com.whatsapp';
+const APK_PATH   = '/tmp/whatsapp.apk';
+const SCRIPT_DIR = '/tmp/wa_scripts';
+
+// UIAutomator XML paths
+const DEVICE_XML = '/sdcard/view.xml';   // path on the Android device
+const HOST_XML   = '/tmp/view.xml';      // path on the CI runner (host)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phone number parsing
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Parse a full international number like "2348012345678" into:
+ * Parse a bare international number like "2348012345678" into:
  *   { countryCode: '234', nationalNumber: '8012345678', country: 'NG' }
- *
- * libphonenumber-js requires a + prefix for E.164 parsing.
- * We try with + prefix first, then brute-force country code matching
- * as a fallback for numbers the library can't auto-detect.
  */
 function parsePhone(fullNumber) {
   const withPlus = `+${fullNumber}`;
   try {
     if (isValidPhoneNumber(withPlus)) {
-      const parsed = parsePhoneNumber(withPlus);
+      const p = parsePhoneNumber(withPlus);
       return {
-        countryCode: String(parsed.countryCallingCode),
-        nationalNumber: parsed.nationalNumber,
-        country: parsed.country || 'unknown',
+        countryCode:    String(p.countryCallingCode),
+        nationalNumber: p.nationalNumber,
+        country:        p.country || 'unknown',
       };
     }
   } catch (_) {}
 
-  // Fallback: try common country code lengths (1, 2, 3 digits)
-  // Sorted by length descending so 3-digit codes match before 1-digit
-  const cc3 = fullNumber.substring(0, 3);
-  const cc2 = fullNumber.substring(0, 2);
-  const cc1 = fullNumber.substring(0, 1);
-
-  for (const cc of [cc3, cc2, cc1]) {
+  // Fallback: try 3-digit, 2-digit, 1-digit prefix as country code
+  for (const len of [3, 2, 1]) {
+    const cc  = fullNumber.substring(0, len);
+    const nat = fullNumber.substring(len);
     try {
-      const national = fullNumber.substring(cc.length);
-      const attempt = `+${cc}${national}`;
-      if (isValidPhoneNumber(attempt)) {
-        const parsed = parsePhoneNumber(attempt);
+      if (isValidPhoneNumber(`+${cc}${nat}`)) {
+        const p = parsePhoneNumber(`+${cc}${nat}`);
         return {
-          countryCode: String(parsed.countryCallingCode),
-          nationalNumber: parsed.nationalNumber,
-          country: parsed.country || 'unknown',
+          countryCode:    String(p.countryCallingCode),
+          nationalNumber: p.nationalNumber,
+          country:        p.country || 'unknown',
         };
       }
     } catch (_) {}
   }
 
-  // Last resort: assume first 3 digits are country code
   return {
-    countryCode: fullNumber.substring(0, 3),
+    countryCode:    fullNumber.substring(0, 3),
     nationalNumber: fullNumber.substring(3),
-    country: 'unknown',
+    country:        'unknown',
   };
 }
 
-// ── Utilities ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilities
+// ─────────────────────────────────────────────────────────────────────────────
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -94,17 +102,19 @@ function log(tag, msg) {
   console.log(`[${ts}] [${tag}] ${msg}`);
 }
 
-// Write a shell script to disk and execute it.
-// This avoids ALL quoting issues — the command is never interpolated.
+/**
+ * Write a shell script to disk and execute it via `sh`.
+ * Avoids all shell quoting / variable interpolation issues.
+ */
 function runScript(scriptContent, timeoutMs = 30000) {
   fs.mkdirSync(SCRIPT_DIR, { recursive: true });
   const file = path.join(SCRIPT_DIR, `cmd_${Date.now()}.sh`);
   fs.writeFileSync(file, `#!/bin/sh\n${scriptContent}\n`, { mode: 0o755 });
   try {
     const out = execSync(`sh ${file}`, {
-      timeout: timeoutMs,
+      timeout:  timeoutMs,
       encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio:    ['pipe', 'pipe', 'pipe'],
     });
     return (out || '').trim();
   } catch (e) {
@@ -114,25 +124,27 @@ function runScript(scriptContent, timeoutMs = 30000) {
   }
 }
 
-// Run an adb command (not adb shell — for host-side adb commands)
+/** Run an ADB host-side command (e.g. `adb pull`, `adb install`). */
 function adb(args, timeoutMs = 30000) {
   return runScript(`adb ${args} 2>&1`, timeoutMs);
 }
 
-// Run a command inside the Android emulator via adb shell
-// cmd is written to a file — no shell escaping needed
+/** Execute a command inside the emulator via `adb shell`. */
 function adbShell(cmd, timeoutMs = 30000) {
-  const file = path.join(SCRIPT_DIR, `shell_${Date.now()}.sh`);
   fs.mkdirSync(SCRIPT_DIR, { recursive: true });
+  const file = path.join(SCRIPT_DIR, `shell_${Date.now()}.sh`);
   fs.writeFileSync(file, `#!/bin/sh\n${cmd}\n`, { mode: 0o755 });
   const out = runScript(`adb shell < ${file}`, timeoutMs);
   try { fs.unlinkSync(file); } catch (_) {}
   return out;
 }
 
-// ── ADB input helpers ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// ADB input helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function tap(x, y) {
+  log('ADB', `input tap ${x} ${y}`);
   adbShell(`input tap ${x} ${y}`);
 }
 
@@ -144,51 +156,118 @@ function keyevent(code) {
   adbShell(`input keyevent ${code}`);
 }
 
-// Type text safely — write each char via keyevent to avoid encoding issues
+/**
+ * Type text via `adb shell input text`.
+ * Safe for digits and plain ASCII — non-alphanumeric chars are percent-encoded.
+ */
 function typeText(text) {
-  // Use ADB text input — works for ASCII digits and letters
-  // Write to a script so special chars don't get shell-interpreted
-  const safe = text.replace(/[^a-zA-Z0-9+]/g, (c) => {
-    // Encode non-alphanumeric chars for adb input text
-    return encodeURIComponent(c).replace(/%/g, '%25');
+  const safe = String(text).replace(/[^a-zA-Z0-9]/g, (c) => {
+    const enc = encodeURIComponent(c);
+    return enc.startsWith('%') ? enc : c;
   });
   adbShell(`input text "${safe}"`);
 }
 
-// Type digits individually via tap on the number (most reliable for OTP boxes)
+/**
+ * Type digits one at a time with a small pause between each.
+ * More reliable than typeText() for individual OTP input boxes.
+ */
 function typeDigits(digits) {
-  for (const d of digits) {
+  for (const d of String(digits)) {
     adbShell(`input text ${d}`);
-    runScript('sleep 0.2');
+    runScript('sleep 0.25');
   }
 }
 
-// ── UI inspection ─────────────────────────────────────────────────────────────
+/** Triple-tap a field to select all, delete, then type replacement text. */
+function clearFieldAndType(x, y, text) {
+  tap(x, y);
+  runScript('sleep 0.3');
+  adbShell(`input tap ${x} ${y}`);
+  adbShell(`input tap ${x} ${y}`);
+  adbShell(`input tap ${x} ${y}`);
+  runScript('sleep 0.2');
+  keyevent('KEYCODE_CTRL_A');
+  runScript('sleep 0.1');
+  keyevent('KEYCODE_DEL');
+  runScript('sleep 0.2');
+  typeText(text);
+}
 
-// Dump UI hierarchy to XML and return it
-// Retries until valid XML is returned or timeout
-async function dumpUI(timeoutMs = 8000) {
+// ─────────────────────────────────────────────────────────────────────────────
+// UIAutomator XML pipeline
+//
+//   Step 1 — adb shell uiautomator dump /sdcard/view.xml
+//             Captures the live UI hierarchy and writes it to the device SD card.
+//
+//   Step 2 — adb pull /sdcard/view.xml /tmp/view.xml
+//             Transfers the XML file from the device to the host filesystem.
+//
+//   Step 3 — fs.readFileSync('/tmp/view.xml', 'utf8')
+//             Reads the XML into a Node.js string for parsing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Capture the current UI hierarchy and return it as an XML string.
+ *
+ * Retries until valid XML is returned or timeoutMs is exhausted.
+ * Returns '' if the UI could not be captured.
+ *
+ * @param {number} timeoutMs   Max total wait time (default 8 s)
+ * @param {number} retryDelay  Pause between retries (default 1 s)
+ * @returns {Promise<string>}
+ */
+async function dumpUI(timeoutMs = 8000, retryDelay = 1000) {
   const deadline = Date.now() + timeoutMs;
+
   while (Date.now() < deadline) {
-    adbShell('uiautomator dump /sdcard/ui.xml');
-    const xml = adbShell('cat /sdcard/ui.xml', 5000);
-    if (xml && xml.includes('<hierarchy')) return xml;
-    await sleep(1000);
+    try {
+      // ── Step 1: dump hierarchy to device SD card ────────────────────────
+      adbShell(`uiautomator dump ${DEVICE_XML} 2>/dev/null`);
+
+      // ── Step 2: pull the XML file to the host ───────────────────────────
+      const pullResult = adb(`pull ${DEVICE_XML} ${HOST_XML}`, 10000);
+      if (pullResult.toLowerCase().includes('error') && !pullResult.includes('pulled')) {
+        log('XML', `pull failed (${pullResult.substring(0, 80)}) — retrying`);
+        await sleep(retryDelay);
+        continue;
+      }
+
+      // ── Step 3: read and validate the XML ───────────────────────────────
+      if (!fs.existsSync(HOST_XML)) {
+        log('XML', 'host file not found — retrying');
+        await sleep(retryDelay);
+        continue;
+      }
+
+      const xml = fs.readFileSync(HOST_XML, 'utf8');
+      if (xml && xml.includes('<hierarchy')) {
+        return xml; // valid UI hierarchy
+      }
+
+      log('XML', 'invalid XML content — retrying');
+    } catch (err) {
+      log('XML', `dumpUI error: ${err.message}`);
+    }
+
+    await sleep(retryDelay);
   }
+
+  log('XML', 'dumpUI timed out');
   return '';
 }
 
-// Return up to 15 visible text strings from current screen
-async function screenTexts() {
+/** Collect up to `limit` unique visible text strings from the current screen. */
+async function screenTexts(limit = 20) {
   const xml = await dumpUI();
-  const texts = [];
-  const re = /text="([^"]{1,60})"/g;
+  const seen = new Set();
+  const re   = /text="([^"]{1,80})"/g;
   let m;
   while ((m = re.exec(xml)) !== null) {
     const t = m[1].trim();
-    if (t) texts.push(t);
+    if (t) seen.add(t);
   }
-  return [...new Set(texts)].slice(0, 15);
+  return [...seen].slice(0, limit);
 }
 
 async function logScreen(label = 'SCREEN') {
@@ -197,10 +276,174 @@ async function logScreen(label = 'SCREEN') {
   return texts;
 }
 
-// Wait until the screen contains a specific string
-// Returns the full XML when found, null on timeout
-async function waitForScreen(text, timeoutMs = 60000) {
-  log('WAIT', `"${text}" (${timeoutMs / 1000}s)`);
+// ─────────────────────────────────────────────────────────────────────────────
+// XML element detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Parse a UIAutomator bounds string like "[x1,y1][x2,y2]".
+ * Returns { x1, y1, x2, y2, cx, cy } where cx/cy are the centre coordinates.
+ */
+function parseBounds(boundsStr) {
+  const m = boundsStr.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+  if (!m) return null;
+  const x1 = parseInt(m[1], 10);
+  const y1 = parseInt(m[2], 10);
+  const x2 = parseInt(m[3], 10);
+  const y2 = parseInt(m[4], 10);
+  return { x1, y1, x2, y2, cx: Math.round((x1 + x2) / 2), cy: Math.round((y1 + y2) / 2) };
+}
+
+/**
+ * Find a UI node whose `text` or `content-desc` attribute matches `needle`.
+ *
+ * Each node in UIAutomator XML is a self-closing tag:
+ *   <node … text="AGREE AND CONTINUE" … bounds="[x1,y1][x2,y2]" … />
+ *
+ * We iterate over every <node … /> block, test the needle, and extract bounds
+ * from the SAME node — so we never mix up coordinates from different elements.
+ *
+ * @param {string}  xml    Raw UIAutomator XML
+ * @param {string}  needle Text or content-desc to match
+ * @param {boolean} exact  If true, require exact (case-insensitive) equality
+ * @returns {{ x1,y1,x2,y2,cx,cy }|null}
+ */
+function findElement(xml, needle, exact = false) {
+  if (!xml) return null;
+  const low    = needle.toLowerCase();
+  const nodeRe = /<node[^>]+\/>/gs;
+  let match;
+
+  while ((match = nodeRe.exec(xml)) !== null) {
+    const node = match[0];
+    const textM = node.match(/\btext="([^"]*)"/);
+    const descM = node.match(/\bcontent-desc="([^"]*)"/);
+    const tv    = textM ? textM[1] : '';
+    const dv    = descM ? descM[1] : '';
+
+    const hit = exact
+      ? (tv.toLowerCase() === low || dv.toLowerCase() === low)
+      : (tv.toLowerCase().includes(low) || dv.toLowerCase().includes(low));
+
+    if (hit) {
+      const bm = node.match(/\bbounds="(\[[^\]]+\]\[[^\]]+\])"/);
+      if (bm) {
+        const coords = parseBounds(bm[1]);
+        if (coords) return coords;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Find a node by resource-id substring (e.g. "registration_phone").
+ */
+function findElementById(xml, resourceId) {
+  if (!xml) return null;
+  const nodeRe = /<node[^>]+\/>/gs;
+  let match;
+  while ((match = nodeRe.exec(xml)) !== null) {
+    const node = match[0];
+    const idM = node.match(/\bresource-id="([^"]*)"/);
+    if (idM && idM[1].includes(resourceId)) {
+      const bm = node.match(/\bbounds="(\[[^\]]+\]\[[^\]]+\])"/);
+      if (bm) return parseBounds(bm[1]);
+    }
+  }
+  return null;
+}
+
+/**
+ * Find a node by class name (e.g. "EditText") with an optional hint string.
+ */
+function findElementByClass(xml, className, hintText = null) {
+  if (!xml) return null;
+  const nodeRe = /<node[^>]+\/>/gs;
+  let match;
+  while ((match = nodeRe.exec(xml)) !== null) {
+    const node = match[0];
+    const clsM = node.match(/\bclass="([^"]*)"/);
+    if (!clsM || !clsM[1].includes(className)) continue;
+    if (hintText) {
+      const tv = (node.match(/\btext="([^"]*)"/)?.[1] || '');
+      const hv = (node.match(/\bhint="([^"]*)"/)?.[1] || '');
+      if (!`${tv}${hv}`.toLowerCase().includes(hintText.toLowerCase())) continue;
+    }
+    const bm = node.match(/\bbounds="(\[[^\]]+\]\[[^\]]+\])"/);
+    if (bm) return parseBounds(bm[1]);
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tap helpers with retry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Find an element by text/content-desc and tap it.
+ * Re-dumps the UI on every retry attempt.
+ *
+ * @param {string}      needle      Text to search for
+ * @param {string|null} xml         Pre-captured XML (null = dump fresh)
+ * @param {number}      retries     Max attempts (default 3)
+ * @param {number}      retryDelay  Pause between attempts in ms (default 2000)
+ * @returns {Promise<boolean>}      true if element was found and tapped
+ */
+async function tapElement(needle, xml = null, retries = 3, retryDelay = 2000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const currentXml = xml || (await dumpUI());
+    const coords     = findElement(currentXml, needle);
+
+    if (coords) {
+      log('TAP', `"${needle}" → (${coords.cx},${coords.cy}) [attempt ${attempt}]`);
+      tap(coords.cx, coords.cy);
+      await sleep(800);
+      return true;
+    }
+
+    log('TAP', `"${needle}" not found (attempt ${attempt}/${retries})`);
+    if (attempt < retries) {
+      await sleep(retryDelay);
+      xml = null; // force fresh dump on next attempt
+    }
+  }
+  log('TAP', `"${needle}" — giving up`);
+  return false;
+}
+
+/** Tap an element located by resource-id, with retry. */
+async function tapElementById(resourceId, xml = null, retries = 3, retryDelay = 2000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const currentXml = xml || (await dumpUI());
+    const coords     = findElementById(currentXml, resourceId);
+
+    if (coords) {
+      log('TAP_ID', `"${resourceId}" → (${coords.cx},${coords.cy}) [attempt ${attempt}]`);
+      tap(coords.cx, coords.cy);
+      await sleep(800);
+      return true;
+    }
+
+    log('TAP_ID', `"${resourceId}" not found (attempt ${attempt}/${retries})`);
+    if (attempt < retries) {
+      await sleep(retryDelay);
+      xml = null;
+    }
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Screen wait helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Poll the UI until the XML contains `text` (case-insensitive).
+ * Returns the XML when found, or null on timeout.
+ */
+async function waitForScreen(text, timeoutMs = 60000, pollMs = 2500) {
+  log('WAIT', `"${text}" (up to ${timeoutMs / 1000}s)`);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const xml = await dumpUI();
@@ -208,15 +451,18 @@ async function waitForScreen(text, timeoutMs = 60000) {
       log('FOUND', `"${text}"`);
       return xml;
     }
-    await sleep(2000);
+    await sleep(pollMs);
   }
   log('TIMEOUT', `"${text}" not found`);
   return null;
 }
 
-// Wait for any one of multiple strings — returns { xml, matched }
-async function waitForAny(texts, timeoutMs = 60000) {
-  log('WAIT', `any of: ${texts.map(t => `"${t}"`).join(', ')} (${timeoutMs / 1000}s)`);
+/**
+ * Wait for any one of multiple text strings.
+ * Returns { xml, matched } — matched is the string that triggered.
+ */
+async function waitForAny(texts, timeoutMs = 60000, pollMs = 2500) {
+  log('WAIT', `any of [${texts.map(t => `"${t}"`).join(', ')}] (${timeoutMs / 1000}s)`);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const xml = await dumpUI();
@@ -226,81 +472,57 @@ async function waitForAny(texts, timeoutMs = 60000) {
         return { xml, matched: text };
       }
     }
-    await sleep(2000);
+    await sleep(pollMs);
   }
   log('TIMEOUT', `none of [${texts.join(', ')}] found`);
   return { xml: '', matched: null };
 }
 
-// Find element bounds by text and tap it
-async function tapElement(text, xml = null) {
-  if (!xml) xml = await dumpUI();
-  const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const patterns = [
-    new RegExp(`text="${escaped}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`, 'i'),
-    new RegExp(`content-desc="${escaped}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`, 'i'),
-  ];
-  for (const re of patterns) {
-    const m = xml.match(re);
-    if (m) {
-      const cx = Math.round((+m[1] + +m[3]) / 2);
-      const cy = Math.round((+m[2] + +m[4]) / 2);
-      log('TAP', `"${text}" → (${cx},${cy})`);
-      tap(cx, cy);
-      await sleep(800);
-      return true;
-    }
-  }
-  log('TAP', `"${text}" bounds not found — skipping`);
-  return false;
-}
-
-// ── Webhook ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Webhook
+// ─────────────────────────────────────────────────────────────────────────────
 
 function webhook(event, extra = {}) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       event,
-      phone_number: PHONE,
+      phone_number:     PHONE,
       telegram_user_id: parseInt(USER_ID, 10),
-      run_id: RUN_ID,
+      run_id:           RUN_ID,
       ...extra,
     });
-    const u = new URL(WEBHOOK_URL);
+    const u       = new URL(WEBHOOK_URL);
     const isHttps = u.protocol === 'https:';
     const options = {
       hostname: u.hostname,
-      port: u.port || (isHttps ? 443 : 80),
-      path: u.pathname,
-      method: 'POST',
+      port:     u.port || (isHttps ? 443 : 80),
+      path:     u.pathname,
+      method:   'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
+        'Content-Type':     'application/json',
+        'Content-Length':   Buffer.byteLength(body),
         'X-Webhook-Secret': WEBHOOK_SECRET,
       },
     };
-    const lib = isHttps ? https : http;
-    const req = lib.request(options, (res) => {
+    const req = (isHttps ? https : http).request(options, (res) => {
       log('WEBHOOK', `${event} → HTTP ${res.statusCode}`);
       resolve(res.statusCode);
     });
-    req.on('error', (e) => {
-      log('WEBHOOK', `${event} ERROR: ${e.message}`);
-      resolve(0);
-    });
+    req.on('error', (e) => { log('WEBHOOK', `${event} error: ${e.message}`); resolve(0); });
     req.setTimeout(10000, () => { req.destroy(); resolve(0); });
     req.write(body);
     req.end();
   });
 }
 
-// ── OTP polling ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// OTP polling
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Poll the bot's /otp/{phone} endpoint until the user replies on Telegram
 async function pollForOtp(timeoutMs = 13 * 60 * 1000) {
-  const otpUrl = `${RENDER_BASE}/otp/${encodeURIComponent(PHONE)}`;
+  const otpUrl  = `${RENDER_BASE}/otp/${encodeURIComponent(PHONE)}`;
   const deadline = Date.now() + timeoutMs;
-  log('OTP', `Polling ${otpUrl} for up to ${timeoutMs / 60000} min...`);
+  log('OTP', `Polling ${otpUrl} for up to ${timeoutMs / 60000} min`);
   while (Date.now() < deadline) {
     await sleep(5000);
     try {
@@ -311,19 +533,19 @@ async function pollForOtp(timeoutMs = 13 * 60 * 1000) {
       }
     } catch (_) {}
   }
-  log('OTP', 'Timed out waiting for user reply');
+  log('OTP', 'Timed out waiting for OTP');
   return null;
 }
 
 function httpGet(url, headers = {}) {
   return new Promise((resolve, reject) => {
-    const u = new URL(url);
+    const u       = new URL(url);
     const isHttps = u.protocol === 'https:';
     const req = (isHttps ? https : http).request({
       hostname: u.hostname,
-      port: u.port || (isHttps ? 443 : 80),
-      path: u.pathname + u.search,
-      method: 'GET',
+      port:     u.port || (isHttps ? 443 : 80),
+      path:     u.pathname + u.search,
+      method:   'GET',
       headers,
     }, (res) => {
       let data = '';
@@ -336,7 +558,9 @@ function httpGet(url, headers = {}) {
   });
 }
 
-// ── Parse WhatsApp wait time strings ─────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Wait-time string parsing  ("Try again in 2 hours 30 minutes")
+// ─────────────────────────────────────────────────────────────────────────────
 
 function parseWaitSeconds(text) {
   let total = 0;
@@ -349,512 +573,635 @@ function parseWaitSeconds(text) {
   return total > 0 ? total : 600;
 }
 
-// ── APK install ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Registration steps
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Step A: APK install ───────────────────────────────────────────────────────
 
 async function installWhatsApp() {
-  if (!fs.existsSync(APK_PATH)) {
-    throw new Error(`APK not found at ${APK_PATH}`);
-  }
+  if (!fs.existsSync(APK_PATH)) throw new Error(`APK not found at ${APK_PATH}`);
   const sizeMB = (fs.statSync(APK_PATH).size / 1024 / 1024).toFixed(1);
   log('INSTALL', `APK size: ${sizeMB} MB`);
 
-  // Show which native lib folders the APK contains
-  const libScript = `unzip -l ${APK_PATH} | grep -E "^[[:space:]]+[0-9]" | awk '{print $4}' | grep "^lib/" | cut -d/ -f1-2 | sort -u`;
-  fs.writeFileSync('/tmp/libcheck.sh', libScript);
-  const libs = runScript('sh /tmp/libcheck.sh 2>/dev/null', 15000);
-  log('INSTALL', `APK lib folders:\n${libs || '  (none — pure Java APK)'}`);
+  await sleep(2000); // allow ADB to settle after emulator boot
 
-  // ADB needs a moment after boot
-  await sleep(2000);
-
-  // Strategy 1: push to device then install via pm — faster than adb install for large APKs
-  // adb push streams at full speed, pm install is local on-device (no ADB overhead)
-  log('INSTALL', 'Pushing APK to device...');
+  // Strategy 1: push to device then install via `pm` (fastest for large APKs)
+  log('INSTALL', 'Pushing APK to /data/local/tmp/...');
   const pushOut = runScript(`adb push ${APK_PATH} /data/local/tmp/whatsapp.apk 2>&1`, 600000);
-  log('INSTALL', `Push output: ${pushOut}`);
+  log('INSTALL', `Push: ${pushOut.substring(0, 120)}`);
 
   if (pushOut.toLowerCase().includes('error') && !pushOut.includes('pushed')) {
-    log('INSTALL', 'Push failed — falling back to adb install...');
-    const directOut = runScript(`adb install -r -t -g ${APK_PATH} 2>&1`, 600000);
-    log('INSTALL', `Direct install output: ${directOut}`);
-    if (!directOut.toLowerCase().includes('success') && !directOut.includes('pushed')) {
-      throw new Error(`Install failed: ${directOut}`);
-    }
+    // Strategy 2: direct adb install
+    log('INSTALL', 'Push failed — falling back to direct adb install');
+    const out = runScript(`adb install -r -t -g ${APK_PATH} 2>&1`, 600000);
+    log('INSTALL', `adb install: ${out.substring(0, 120)}`);
+    if (!out.toLowerCase().includes('success')) throw new Error(`Install failed: ${out}`);
   } else {
-    // Install from the on-device copy
-    log('INSTALL', 'Installing from on-device copy...');
-    const pmOut = runScript('adb shell pm install -r -t -g /data/local/tmp/whatsapp.apk 2>&1', 120000);
-    log('INSTALL', `pm install output: ${pmOut}`);
+    log('INSTALL', 'Installing from on-device copy via pm...');
+    const pmOut = runScript(
+      'adb shell pm install -r -t -g /data/local/tmp/whatsapp.apk 2>&1', 120000
+    );
+    log('INSTALL', `pm: ${pmOut.substring(0, 120)}`);
 
     if (!pmOut.toLowerCase().includes('success')) {
-      // Fallback: try adb install directly
-      log('INSTALL', 'pm install failed — trying adb install directly...');
-      const fallbackOut = runScript(`adb install -r -t -g ${APK_PATH} 2>&1`, 600000);
-      log('INSTALL', `Fallback output: ${fallbackOut}`);
-      if (!fallbackOut.toLowerCase().includes('success')) {
-        // Last check via pm list
+      // Strategy 3: adb install fallback
+      log('INSTALL', 'pm failed — trying adb install directly');
+      const fbOut = runScript(`adb install -r -t -g ${APK_PATH} 2>&1`, 600000);
+      log('INSTALL', `fallback: ${fbOut.substring(0, 120)}`);
+      if (!fbOut.toLowerCase().includes('success')) {
         await sleep(3000);
-        const pkgList = runScript('adb shell pm list packages 2>/dev/null', 10000);
-        if (!pkgList.includes('com.whatsapp')) {
-          throw new Error(`Install failed. pm: ${pmOut} | adb: ${fallbackOut}`);
-        }
+        const pkg = runScript('adb shell pm list packages 2>/dev/null', 10000);
+        if (!pkg.includes(WA_PACKAGE)) throw new Error(`Install verification failed`);
       }
     }
   }
 
-  // Verify installation
-  await sleep(2000);
-  const pkgList = runScript('adb shell pm list packages 2>/dev/null', 10000);
-  if (pkgList.includes('com.whatsapp')) {
-    log('INSTALL', 'Verified via pm list — installed');
-    return;
+  // Verify via pm list (retry up to 3 times — pm list can be slow)
+  for (let i = 1; i <= 3; i++) {
+    await sleep(2000);
+    const pkg = runScript('adb shell pm list packages 2>/dev/null', 10000);
+    if (pkg.includes(WA_PACKAGE)) {
+      log('INSTALL', `Verified (attempt ${i})`);
+      return;
+    }
   }
-
-  // One final check — sometimes pm list is slow to update
-  await sleep(5000);
-  const pkgList2 = runScript('adb shell pm list packages 2>/dev/null', 10000);
-  if (pkgList2.includes('com.whatsapp')) {
-    log('INSTALL', 'Verified via pm list (delayed) — installed');
-    return;
-  }
-
   throw new Error('WhatsApp package not found after install');
 }
 
-// ── Screen unlock ─────────────────────────────────────────────────────────────
+// ── Step B: Screen unlock ────────────────────────────────────────────────────
 
 async function unlockScreen() {
-  log('UNLOCK', 'Waking and unlocking screen...');
+  log('UNLOCK', 'Waking and unlocking screen');
   keyevent('KEYCODE_WAKEUP');
   await sleep(500);
-  swipe(540, 1800, 540, 900, 400);  // Swipe up to unlock
+  swipe(540, 1800, 540, 900, 400);
   await sleep(500);
   keyevent('KEYCODE_HOME');
   await sleep(1000);
-  // Keep screen on for the full session
   adbShell('settings put global stay_on_while_plugged_in 3');
   adbShell('settings put secure lockscreen.disabled 1');
   await logScreen('UNLOCK');
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Step C: Grant permissions ────────────────────────────────────────────────
 
-async function main() {
-  log('MAIN', `Starting registration for ${PHONE}`);
+const WA_PERMS = [
+  'android.permission.READ_CONTACTS',
+  'android.permission.WRITE_CONTACTS',
+  'android.permission.READ_PHONE_STATE',
+  'android.permission.CALL_PHONE',
+  'android.permission.CAMERA',
+  'android.permission.RECORD_AUDIO',
+  'android.permission.READ_EXTERNAL_STORAGE',
+  'android.permission.WRITE_EXTERNAL_STORAGE',
+  'android.permission.RECEIVE_SMS',
+  'android.permission.READ_SMS',
+  'android.permission.SEND_SMS',
+  'android.permission.GET_ACCOUNTS',
+  'android.permission.POST_NOTIFICATIONS',
+];
 
-  // ── Parse phone number into country code + national number ───────────────
-  const phoneInfo = parsePhone(PHONE);
-  log('MAIN', `Parsed: country=${phoneInfo.country} cc=${phoneInfo.countryCode} national=${phoneInfo.nationalNumber}`);
+async function grantPermissions() {
+  log('PERMS', 'Granting permissions...');
+  for (const p of WA_PERMS) adbShell(`pm grant ${WA_PACKAGE} ${p} 2>/dev/null || true`);
+  log('PERMS', 'Done');
+}
 
-  // ── 1. Verify emulator is ready ─────────────────────────────────────────
-  await sleep(3000);
-  const bootProp = adbShell('getprop sys.boot_completed');
-  if (bootProp.trim() !== '1') {
-    throw new Error(`Emulator not ready — boot_completed=${bootProp}`);
-  }
-  log('MAIN', 'Emulator ready');
+// ── Step D: Launch WhatsApp ──────────────────────────────────────────────────
 
-  // ── 2. Unlock screen ────────────────────────────────────────────────────
-  await unlockScreen();
-
-  // ── 3. Install WhatsApp ──────────────────────────────────────────────────
-  await installWhatsApp();
-  log('MAIN', 'WhatsApp installed');
-
-  // ── 4. Grant permissions & Launch WhatsApp ──────────────────────────────
-  log('MAIN', 'Granting permissions and launching WhatsApp...');
-
-  keyevent('KEYCODE_HOME');
-  await sleep(1000);
-
-  const WA_PERMS = [
-    'android.permission.READ_CONTACTS',
-    'android.permission.WRITE_CONTACTS',
-    'android.permission.READ_PHONE_STATE',
-    'android.permission.CALL_PHONE',
-    'android.permission.CAMERA',
-    'android.permission.RECORD_AUDIO',
-    'android.permission.READ_EXTERNAL_STORAGE',
-    'android.permission.WRITE_EXTERNAL_STORAGE',
-    'android.permission.RECEIVE_SMS',
-    'android.permission.READ_SMS',
-    'android.permission.SEND_SMS',
-    'android.permission.GET_ACCOUNTS',
-  ];
-  for (const perm of WA_PERMS) {
-    adbShell(`pm grant ${WA_PACKAGE} ${perm} 2>/dev/null || true`);
-  }
-  log('MAIN', 'Permissions granted');
-
-  // ── Update Google Play Services via ADB ──────────────────────────────────
-  // WhatsApp 2024+ requires GPS 22.x minimum. API 33 google_apis_playstore
-  // ships with 22.x but we verify and attempt an update if needed.
-  log('MAIN', 'Checking Google Play Services version...');
-  const gpsVersion = adbShell('dumpsys package com.google.android.gms | grep versionName | head -1 2>/dev/null');
-  log('MAIN', `GPS version: ${gpsVersion || 'unknown'}`);
-
-  // Extract version number and check if update needed
-  const gpsVerMatch = gpsVersion.match(/versionName=([\d.]+)/);
-  const gpsMajor = gpsVerMatch ? parseInt(gpsVerMatch[1].split('.')[0]) : 0;
-  log('MAIN', `GPS major version: ${gpsMajor}`);
-
-  if (gpsMajor < 22) {
-    log('MAIN', 'GPS too old — downloading and installing update via ADB...');
-    // Download GPS APK from a reliable source
-    // We use a specific version known to work with WhatsApp
-    fs.writeFileSync('/tmp/dl_gps.sh', 'wget -q "https://dl.google.com/dl/android/studio/gps/gms_core.apk" -O /tmp/gps.apk --timeout=60 || true\\nstat -c%s /tmp/gps.apk 2>/dev/null || echo 0\\n');
-    const gpsDownload = runScript('sh /tmp/dl_gps.sh', 90000);
-    log('MAIN', `GPS download result: ${gpsDownload}`);
-
-    const gpsSize = parseInt((gpsDownload.match(/^(\d+)$/m) || ['0'])[0]);
-    if (gpsSize > 1000000) {
-      const gpsInstall = runScript('adb install -r /tmp/gps.apk 2>&1', 120000);
-      log('MAIN', `GPS install: ${gpsInstall}`);
-      await sleep(5000);
-    } else {
-      log('MAIN', 'GPS download failed — proceeding anyway');
-    }
-  } else {
-    log('MAIN', 'GPS version is sufficient — no update needed');
-  }
-
-  // monkey sends INTENT_ACTION_MAIN + CATEGORY_LAUNCHER — identical to tapping the icon
-  // This is the most reliable foreground launch method on Android emulators
+async function launchWhatsApp() {
+  log('LAUNCH', 'Launching via monkey...');
   adbShell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1 2>/dev/null`);
-  log('MAIN', 'Launched via monkey — waiting 10s for WhatsApp to render...');
-  await sleep(10000);
-  await logScreen('LAUNCH');
+  log('LAUNCH', 'Waiting 12s for first render...');
+  await sleep(12000);
 
-  const launchTexts = await screenTexts();
-  const isHomeScreen = launchTexts.some(t =>
-    ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday',
-     'Messages','Chrome','Camera'].some(w => t.includes(w))
+  const texts = await logScreen('LAUNCH');
+  const isCrash = texts.some(t => t.includes('keeps stopping'));
+  const isHome  = texts.some(t =>
+    ['Messages', 'Chrome', 'Camera', 'Sunday', 'Monday', 'Tuesday'].some(w => t.includes(w))
   );
-  const isCrashing = launchTexts.some(t => t.includes('keeps stopping'));
 
-  if (isCrashing) {
-    log('MAIN', 'Crash — dismissing, clearing data, relaunching...');
-    const crashXml = await dumpUI();
-    await tapElement('Close app', crashXml);
+  if (isCrash) {
+    log('LAUNCH', 'App crashed — clearing data and retrying');
+    await tapElement('Close app', null, 1);
     await sleep(2000);
     adbShell(`pm clear ${WA_PACKAGE} 2>/dev/null || true`);
     await sleep(1000);
-    for (const perm of WA_PERMS) {
-      adbShell(`pm grant ${WA_PACKAGE} ${perm} 2>/dev/null || true`);
-    }
+    await grantPermissions();
     adbShell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1 2>/dev/null`);
-    await sleep(12000);
+    await sleep(14000);
     await logScreen('AFTER-CLEAR');
-
-  } else if (isHomeScreen) {
-    log('MAIN', 'Still home screen — trying am start fallback...');
+  } else if (isHome) {
+    log('LAUNCH', 'Still home — trying am start');
     adbShell(`am start -n ${WA_PACKAGE}/${WA_PACKAGE}.Main 2>/dev/null`);
-    await sleep(8000);
+    await sleep(10000);
     await logScreen('AFTER-AMSTART');
   }
-
-
-  // ── 5. Dismiss system alerts then accept terms ───────────────────────────
-  // google_apis emulators show "Alert / OK / More info" (Google Play Services
-  // outdated) before WhatsApp renders. Tap OK up to 5 times to clear it.
-  log('MAIN', 'Dismissing any system alert dialogs...');
-  for (let i = 0; i < 5; i++) {
-    const alertXml = await dumpUI(4000);
-    if (alertXml.includes('Alert') || alertXml.includes('More info') ||
-        alertXml.includes('Google Play') || alertXml.includes('Update')) {
-      log('MAIN', `Alert dialog (attempt ${i+1}) — tapping OK`);
-      const dismissed =
-        await tapElement('OK', alertXml) ||
-        await tapElement('Skip', alertXml) ||
-        await tapElement('Not now', alertXml) ||
-        await tapElement('Cancel', alertXml) ||
-        await tapElement('Close', alertXml);
-      if (!dismissed) tap(540, 1200); // fallback center tap
-      await sleep(2000);
-    } else {
-      break;
-    }
-  }
-
-  // Language screen arrow (newer WhatsApp versions)
-  const langXml2 = await dumpUI(4000);
-  if (langXml2.includes('Choose your language') || langXml2.includes('Welcome to WhatsApp')) {
-    log('MAIN', 'Language screen — tapping arrow');
-    const arrowTapped =
-      await tapElement('next', langXml2) ||
-      await tapElement('Next', langXml2) ||
-      await tapElement('Continue', langXml2);
-    if (!arrowTapped) tap(108, 2100);
-    await sleep(3000);
-  }
-
-  const agreeResult = await waitForAny([
-    'AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree',
-  ], 30000);
-
-  if (agreeResult.matched) {
-    log('MAIN', `Agree screen: "${agreeResult.matched}"`);
-    const agreeXml = await dumpUI();
-    for (const btn of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree']) {
-      if (agreeXml.includes(btn)) {
-        await tapElement(btn, agreeXml);
-        await sleep(4000);
-        break;
-      }
-    }
-    await logScreen('POST-AGREE');
-  }
-
-
-  // ── 6. Enter phone number ─────────────────────────────────────────────
-  await logScreen('AFTER-AGREE-DONE');
-  await sleep(2000);
-
-  // Find and tap phone number input field
-  let phoneInputXml = await dumpUI();
-  const phoneFieldTapped = 
-    await tapElement('Phone number', phoneInputXml) ||
-    await tapElement(`+${phoneInfo.countryCode}`, phoneInputXml) ||
-    await tapElement('Enter your phone number', phoneInputXml);
-
-  if (!phoneFieldTapped) {
-    log('MAIN', 'Phone field not found by text — using fallback tap');
-    tap(650, 1200);
-  }
-  await sleep(1000);
-
-  // Type the national number (without country code)
-  log('MAIN', `Entering phone number: ${phoneInfo.nationalNumber}`);
-  typeText(phoneInfo.nationalNumber);
-  await sleep(2000);
-  await logScreen('AFTER-NUMBER-ENTRY');
-
-  // ── 7. Tap NEXT to request OTP ─────────────────────────────────────────
-  const nextXml = await dumpUI();
-  const nextTapped = 
-    await tapElement('NEXT', nextXml) ||
-    await tapElement('Next', nextXml);
-
-  if (!nextTapped) {
-    log('MAIN', 'NEXT button not found — trying fallback tap');
-    tap(540, 1950);
-  }
-  await sleep(3000);
-
-  // Handle "Is this OK?" confirmation
-  const confirmXml = await dumpUI();
-  const confirmTexts = await screenTexts();
-  if (confirmTexts.some(t => t.includes('Is this OK?') || t.includes('correct'))) {
-    log('MAIN', 'Confirming phone number');
-    await tapElement('OK', confirmXml) || 
-    await tapElement('Yes', confirmXml) ||
-    tap(540, 1450);
-    await sleep(3000);
-  }
-
-  // ── 8. Wait for OTP request screen ─────────────────────────────────────
-  const otpScreenResult = await waitForAny([
-    'Verifying',
-    'Enter 6-digit code',
-    'waiting to automatically detect',
-    'Didn\'t get the code?',
-    'Call me',
-  ], 60000);
-
-  if (!otpScreenResult.matched) {
-    const errorTexts = await screenTexts();
-    if (errorTexts.some(t => t.includes('already registered') || t.includes('already in use'))) {
-      await webhook('bad_number', { reason: 'Phone number already registered' });
-      throw new Error('Number already registered');
-    }
-    if (errorTexts.some(t => t.includes('Too many') || t.includes('try again later'))) {
-      await webhook('rate_limited', { reason: 'Rate limited by WhatsApp' });
-      throw new Error('Rate limited');
-    }
-    if (errorTexts.some(t => t.includes('invalid') || t.includes('not valid'))) {
-      await webhook('bad_number', { reason: 'Invalid phone number' });
-      throw new Error('Invalid number');
-    }
-    throw new Error('OTP screen did not appear after 60s');
-  }
-
-  log('MAIN', `OTP screen detected: "${otpScreenResult.matched}"`);
-  await logScreen('OTP-SCREEN');
-
-  await webhook('awaiting_otp', {
-    message: `OTP requested for ${PHONE}`,
-  });
-
-  // ── 9. Poll for OTP from bot ───────────────────────────────────────────
-  log('MAIN', 'Polling for OTP from bot...');
-
-  const OTP_TIMEOUT = 15 * 60 * 1000;
-  const otpDeadline = Date.now() + OTP_TIMEOUT;
-  let otp = null;
-
-  while (Date.now() < otpDeadline && !otp) {
-    try {
-      const url = `${RENDER_BASE}/internal/get-otp/${encodeURIComponent(PHONE)}`;
-      
-      await new Promise((resolve) => {
-        const client = url.startsWith('https') ? https : http;
-        const req = client.get(url, {
-          headers: { 
-            'X-API-Key': WEBHOOK_SECRET,
-            'Content-Type': 'application/json',
-          },
-          timeout: 5000,
-        }, (res) => {
-          let data = '';
-          res.on('data', chunk => data += chunk);
-          res.on('end', () => {
-            try {
-              const parsed = JSON.parse(data);
-              if (parsed.otp) {
-                otp = parsed.otp;
-                log('MAIN', `Received OTP: ${otp}`);
-              }
-            } catch (e) {}
-            resolve();
-          });
-        });
-        req.on('error', () => resolve());
-        req.on('timeout', () => { req.destroy(); resolve(); });
-      });
-    } catch (e) {
-      log('POLL', `OTP check failed: ${e.message}`);
-    }
-
-    if (!otp) await sleep(3000);
-  }
-
-  if (!otp) {
-    await webhook('timeout', { reason: 'OTP timeout' });
-    throw new Error('OTP timeout');
-  }
-
-  // ── 10. Submit OTP ─────────────────────────────────────────────────────
-  log('MAIN', `Submitting OTP: ${otp}`);
-
-  const otpInputXml = await dumpUI();
-  const singleFieldTapped = await tapElement('Enter 6-digit code', otpInputXml) ||
-                            await tapElement('6-digit code', otpInputXml);
-  
-  if (singleFieldTapped) {
-    await sleep(500);
-    typeDigits(otp);
-  } else {
-    log('MAIN', 'Using multi-box OTP input');
-    tap(200, 1200);
-    await sleep(500);
-    typeDigits(otp);
-  }
-
-  await sleep(8000);
-
-  // ── 11. Check for errors ───────────────────────────────────────────────
-  const afterOtpTexts = await screenTexts();
-  
-  if (afterOtpTexts.some(t => t.includes('wrong') || t.includes('incorrect') || t.includes('Invalid'))) {
-    log('MAIN', 'OTP verification failed');
-    await webhook('error_code', { reason: 'Wrong OTP code' });
-    throw new Error('OTP verification failed');
-  }
-
-  // ── 12. Wait for success screen ────────────────────────────────────────
-  const profileResult = await waitForAny([
-    'Profile info',
-    'Enter your name',
-    'SKIP',
-    'Chats',
-    'Restore',
-  ], 90000);
-
-  if (!profileResult.matched) {
-    const currentTexts = await screenTexts();
-    if (currentTexts.some(t => t.includes('Chats') || t.includes('Status'))) {
-      log('MAIN', 'Already on main screen');
-    } else {
-      throw new Error('Profile screen did not appear');
-    }
-  } else {
-    log('MAIN', `Success screen: "${profileResult.matched}"`);
-  }
-
-  // Skip profile setup
-  const skipXml = await dumpUI();
-  if (skipXml.includes('SKIP') || skipXml.includes('Skip')) {
-    log('MAIN', 'Skipping profile setup');
-    await tapElement('SKIP', skipXml) || await tapElement('Skip', skipXml);
-    await sleep(3000);
-  }
-
-  // Skip backup restore
-  const restoreXml = await dumpUI();
-  if (restoreXml.includes('Restore')) {
-    log('MAIN', 'Skipping backup restore');
-    await tapElement('SKIP', restoreXml) || tap(540, 1950);
-    await sleep(3000);
-  }
-
-  await logScreen('FINAL-SCREEN');
-
-  // ── 13. Extract session data ───────────────────────────────────────────
-  log('MAIN', 'Extracting session data...');
-
-  const sessionData = {
-    phone_number: PHONE,
-    registered_at: new Date().toISOString(),
-  };
-
-  try {
-    const keyFile = adbShell('cat /data/data/com.whatsapp/files/key 2>/dev/null');
-    if (keyFile && keyFile.length > 0) {
-      sessionData.encryption_key = Buffer.from(keyFile).toString('base64');
-      log('SESSION', 'Encryption key extracted');
-    }
-  } catch (e) {
-    log('SESSION', `Could not read key: ${e.message}`);
-  }
-
-  try {
-    const prefs = adbShell('cat /data/data/com.whatsapp/shared_prefs/com.whatsapp_preferences.xml 2>/dev/null');
-    if (prefs && prefs.includes('<?xml')) {
-      sessionData.preferences = prefs;
-      log('SESSION', 'Preferences extracted');
-    }
-  } catch (e) {
-    log('SESSION', `Could not read prefs: ${e.message}`);
-  }
-
-  try {
-    adb('pull /data/data/com.whatsapp/databases/msgstore.db.crypt14 /tmp/msgstore.db 2>&1');
-    if (fs.existsSync('/tmp/msgstore.db')) {
-      const dbContent = fs.readFileSync('/tmp/msgstore.db');
-      sessionData.database = dbContent.toString('base64');
-      log('SESSION', 'Database extracted');
-    }
-  } catch (e) {
-    log('SESSION', `Could not pull database: ${e.message}`);
-  }
-
-  log('MAIN', `Session extracted: ${Object.keys(sessionData).join(', ')}`);
-
-  // ── 14. Send success webhook ───────────────────────────────────────────
-  await webhook('success', {
-    session: sessionData,
-    phone_number: PHONE,
-    registered_at: sessionData.registered_at,
-  });
-
-  log('MAIN', `✅ Registration completed for ${PHONE}`);
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ── Step E: Dismiss system dialogs ──────────────────────────────────────────
+
+async function dismissSystemDialogs() {
+  log('DIALOG', 'Clearing any system alert dialogs...');
+  for (let i = 0; i < 6; i++) {
+    const xml = await dumpUI(4000);
+    const hasAlert =
+      xml.includes('Alert') || xml.includes('More info') ||
+      xml.includes('Google Play') || xml.includes('Update') ||
+      xml.includes('keeps stopping');
+    if (!hasAlert) break;
+
+    log('DIALOG', `Alert detected (pass ${i + 1})`);
+    const dismissed =
+      await tapElement('OK',       xml, 1) ||
+      await tapElement('Skip',     xml, 1) ||
+      await tapElement('Not now',  xml, 1) ||
+      await tapElement('Cancel',   xml, 1) ||
+      await tapElement('Close app',xml, 1) ||
+      await tapElement('Close',    xml, 1);
+
+    if (!dismissed) tap(540, 1200); // blind centre tap
+    await sleep(2000);
+  }
+}
+
+// ── Step F: Accept terms (AGREE AND CONTINUE) ────────────────────────────────
+
+async function acceptTerms() {
+  // Some versions show a language-picker first
+  const langXml = await dumpUI(4000);
+  if (langXml.includes('Choose your language') || langXml.includes('Welcome to WhatsApp')) {
+    log('TERMS', 'Language screen — advancing');
+    const ok =
+      await tapElement('Continue', langXml, 1) ||
+      await tapElement('Next',     langXml, 1) ||
+      await tapElement('next',     langXml, 1);
+    if (!ok) tap(540, 2100);
+    await sleep(3000);
+  }
+
+  log('TERMS', 'Waiting for Agree and Continue...');
+  const result = await waitForAny(
+    ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree'],
+    45000
+  );
+  if (!result.matched) {
+    await logScreen('MISSING-AGREE');
+    throw new Error('Agree and Continue button not found');
+  }
+
+  log('TERMS', `Found: "${result.matched}"`);
+
+  // Fresh dump for accurate coordinates
+  const xml = await dumpUI();
+  for (const btn of ['AGREE AND CONTINUE', 'Agree and continue', 'AGREE', 'Accept', 'I agree']) {
+    if (xml.includes(btn) && await tapElement(btn, xml, 3)) break;
+  }
+
+  await sleep(4000);
+  await logScreen('POST-AGREE');
+}
+
+// ── Step G: Phone number screen ───────────────────────────────────────────────
+//
+//   G1. Dump UI XML                         (adb shell uiautomator dump + adb pull)
+//   G2. Detect country code field           (findElementById / findElement)
+//   G3. Edit country code                   (clearFieldAndType)
+//   G4. Detect national number field        (findElementById / findElementByClass)
+//   G5. Enter national number               (typeDigits)
+//   G6. Tap NEXT                            (tapElement / tapElementById)
+
+/**
+ * Set the country code field.
+ * Tries three strategies in order: country picker row → cc_et field → "+" field.
+ */
+async function setCountryCode(xml, countryCode) {
+  log('CC', `Setting country code to +${countryCode}`);
+
+  // Strategy 1 — open country picker and search
+  const ccRow =
+    findElementById(xml, 'registration_country') ||
+    findElementById(xml, 'country_picker') ||
+    findElementById(xml, 'selected_country') ||
+    findElement(xml, 'country', false);
+
+  if (ccRow) {
+    log('CC', `Opening country picker at (${ccRow.cx},${ccRow.cy})`);
+    tap(ccRow.cx, ccRow.cy);
+    await sleep(2000);
+
+    const pickerXml = await dumpUI();
+    const searchField =
+      findElementById(pickerXml, 'search') ||
+      findElementByClass(pickerXml, 'EditText');
+
+    if (searchField) {
+      tap(searchField.cx, searchField.cy);
+      await sleep(500);
+      typeText(countryCode);
+      await sleep(1500);
+
+      const resultsXml = await dumpUI();
+      const firstResult =
+        findElementById(resultsXml, 'flagView') ||
+        findElementByClass(resultsXml, 'TextView');
+      if (firstResult) {
+        tap(firstResult.cx, firstResult.cy);
+        await sleep(1500);
+        log('CC', 'Selected from picker');
+        return true;
+      }
+    }
+    keyevent('KEYCODE_BACK');
+    await sleep(1000);
+  }
+
+  // Strategy 2 — direct cc_et EditText
+  const ccField =
+    findElementById(xml, 'cc_et') ||
+    findElementById(xml, 'registration_cc');
+  if (ccField) {
+    log('CC', `cc_et field at (${ccField.cx},${ccField.cy}) — overwriting`);
+    clearFieldAndType(ccField.cx, ccField.cy, countryCode);
+    await sleep(800);
+    return true;
+  }
+
+  // Strategy 3 — field whose text starts with "+"
+  const plusField = findElement(xml, '+', false);
+  if (plusField) {
+    log('CC', `"+" field at (${plusField.cx},${plusField.cy}) — overwriting`);
+    clearFieldAndType(plusField.cx, plusField.cy, countryCode);
+    await sleep(800);
+    return true;
+  }
+
+  log('CC', 'WARNING: country code field not found');
+  return false;
+}
+
+/**
+ * Enter the national phone number.
+ * Prefers resource-id detection; falls back to second EditText on screen.
+ */
+async function enterNationalNumber(xml, nationalNumber) {
+  log('PHONE', `Entering national number: ${nationalNumber}`);
+
+  const field =
+    findElementById(xml, 'registration_phone') ||
+    findElementById(xml, 'phone_number')        ||
+    findElementById(xml, 'pn_et')               ||
+    findElementByClass(xml, 'EditText', 'phone') ||
+    findElementByClass(xml, 'EditText', 'number');
+
+  if (field) {
+    log('PHONE', `Phone field at (${field.cx},${field.cy})`);
+    tap(field.cx, field.cy);
+    await sleep(500);
+    keyevent('KEYCODE_CTRL_A');
+    await sleep(100);
+    keyevent('KEYCODE_DEL');
+    await sleep(200);
+    typeDigits(nationalNumber);
+    await sleep(600);
+    return true;
+  }
+
+  // Fallback: collect all EditText nodes; national number is usually the second
+  log('PHONE', 'No phone field by id — collecting all EditText nodes');
+  const editFields = [];
+  const nodeRe = /<node[^>]+\/>/gs;
+  let m;
+  const src = xml || await dumpUI();
+  while ((m = nodeRe.exec(src)) !== null) {
+    const node = m[0];
+    if (!node.includes('EditText') && !node.includes('edit')) continue;
+    const bm = node.match(/\bbounds="(\[[^\]]+\]\[[^\]]+\])"/);
+    if (bm) {
+      const c = parseBounds(bm[1]);
+      if (c) editFields.push(c);
+    }
+  }
+
+  if (editFields.length >= 2) {
+    const f = editFields[1];
+    log('PHONE', `Using second EditText at (${f.cx},${f.cy})`);
+    tap(f.cx, f.cy);
+    await sleep(500);
+    keyevent('KEYCODE_CTRL_A');
+    keyevent('KEYCODE_DEL');
+    await sleep(200);
+    typeDigits(nationalNumber);
+    await sleep(600);
+    return true;
+  }
+
+  log('PHONE', 'WARNING: national number field not found');
+  return false;
+}
+
+/**
+ * Full phone-number screen handler.
+ */
+async function handlePhoneNumberScreen(countryCode, nationalNumber) {
+  log('PHONE_SCREEN', 'Waiting for phone number entry screen...');
+
+  // Wait for any indicator that we're on the phone-number screen
+  const result = await waitForAny([
+    'Enter your phone number',
+    'phone number',
+    "What's your phone number",
+    'enter your number',
+    'registration_phone',
+    'cc_et',
+  ], 60000);
+
+  if (!result.matched) {
+    await logScreen('MISSING-PHONE-SCREEN');
+    throw new Error('Phone number screen did not appear');
+  }
+
+  log('PHONE_SCREEN', `Screen found: "${result.matched}"`);
+
+  // G1 — dump fresh XML for coordinates
+  const xml = await dumpUI();
+
+  // G2 + G3 — detect and edit country code field
+  await setCountryCode(xml, countryCode);
+  await sleep(500);
+
+  // G4 + G5 — detect and enter national number (re-dump after CC change)
+  const xml2 = await dumpUI();
+  await enterNationalNumber(xml2, nationalNumber);
+  await sleep(500);
+
+  // G6 — tap NEXT
+  log('PHONE_SCREEN', 'Tapping NEXT...');
+  const nextXml = await dumpUI();
+  const nextTapped =
+    await tapElement('NEXT',       nextXml, 3) ||
+    await tapElement('Next',       nextXml, 3) ||
+    await tapElement('Done',       nextXml, 3) ||
+    await tapElement('Continue',   nextXml, 3) ||
+    await tapElementById('next_btn',            nextXml, 3) ||
+    await tapElementById('registration_submit', nextXml, 3);
+
+  if (!nextTapped) {
+    // Hide keyboard and retry
+    keyevent('KEYCODE_BACK');
+    await sleep(800);
+    const retryXml = await dumpUI();
+    await tapElement('NEXT', retryXml, 3) || await tapElement('Next', retryXml, 3);
+  }
+
+  await sleep(3000);
+  await logScreen('POST-NEXT');
+}
+
+// ── Step H: Confirm phone number dialog ──────────────────────────────────────
+
+async function confirmPhoneDialog() {
+  log('CONFIRM', 'Checking for confirmation dialog...');
+  const result = await waitForAny(
+    ['Is this your number', 'is this your number', 'Confirm', 'CONTINUE'],
+    20000
+  );
+  if (!result.matched) {
+    log('CONFIRM', 'No confirmation dialog — proceeding');
+    return;
+  }
+  log('CONFIRM', `Dialog: "${result.matched}"`);
+  const xml = await dumpUI();
+  await tapElement('CONTINUE', xml, 2) ||
+  await tapElement('Continue', xml, 2) ||
+  await tapElement('OK',       xml, 2) ||
+  await tapElement('Yes',      xml, 2);
+  await sleep(3000);
+  await logScreen('POST-CONFIRM');
+}
+
+// ── Step I: Rate-limit check ─────────────────────────────────────────────────
+
+async function checkRateLimit() {
+  const xml = await dumpUI(5000);
+  if (!['wait before', 'try again', 'hours', 'minutes'].some(p =>
+    xml.toLowerCase().includes(p)
+  )) return false;
+
+  const re = /text="([^"]{5,80})"/g;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const t = m[1];
+    if (/wait|hour|minute|sec/i.test(t)) {
+      const secs = parseWaitSeconds(t);
+      log('RATE_LIMIT', `Rate limited: "${t}" — ${secs}s`);
+      await webhook('rate_limited', { wait_seconds: secs, message: t });
+      return true;
+    }
+  }
+  return false;
+}
+
+// ── Step J: Enter OTP ────────────────────────────────────────────────────────
+
+async function enterOtp(otp) {
+  log('OTP_ENTRY', `Entering OTP: ${otp}`);
+
+  // Wait for OTP input screen
+  const result = await waitForAny(
+    ['Enter the 6-digit', 'verification code', 'enter the code', 'sms code', 'Verifying'],
+    90000
+  );
+  if (!result.matched) {
+    log('OTP_ENTRY', 'OTP screen not detected — attempting blind entry');
+  }
+
+  const xml = await dumpUI();
+  const otpField =
+    findElementById(xml, 'entry_code_text') ||
+    findElementById(xml, 'otp_input')       ||
+    findElementById(xml, 'sms_code')        ||
+    findElementByClass(xml, 'EditText');
+
+  if (otpField) {
+    log('OTP_ENTRY', `OTP field at (${otpField.cx},${otpField.cy})`);
+    tap(otpField.cx, otpField.cy);
+    await sleep(500);
+    keyevent('KEYCODE_CTRL_A');
+    keyevent('KEYCODE_DEL');
+    await sleep(200);
+  } else {
+    log('OTP_ENTRY', 'No OTP field found — typing directly');
+  }
+
+  typeDigits(otp);
+  await sleep(2000);
+
+  // Tap confirm if shown
+  const afterXml = await dumpUI();
+  await tapElement('NEXT',   afterXml, 2) ||
+  await tapElement('Next',   afterXml, 2) ||
+  await tapElement('Verify', afterXml, 2) ||
+  await tapElement('Submit', afterXml, 2);
+
+  await sleep(4000);
+  await logScreen('POST-OTP');
+}
+
+// ── Step K: Skip post-registration setup screens ─────────────────────────────
+
+async function skipSetupScreens() {
+  const skip = ['Skip', 'Not now', 'SKIP', 'Maybe later', 'Allow', 'OK', 'Continue', 'Done'];
+
+  for (let i = 0; i < 10; i++) {
+    const xml = await dumpUI(5000);
+
+    // Registration complete?
+    if (
+      xml.includes('Chats')           ||
+      xml.includes('NEW CHAT')        ||
+      xml.includes('Start messaging') ||
+      xml.includes('No new chats')
+    ) {
+      log('SETUP', 'Chat list visible — registration complete');
+      return true;
+    }
+
+    // Tap skip/allow buttons
+    let skipped = false;
+    for (const target of skip) {
+      if (xml.includes(target)) {
+        if (await tapElement(target, xml, 1)) { skipped = true; break; }
+      }
+    }
+
+    // Android 13+ notification permission dialog
+    if (!skipped) {
+      const pXml = await dumpUI(3000);
+      if (pXml.includes('Allow') || pXml.includes('Deny')) {
+        await tapElement('Allow', pXml, 1);
+      }
+    }
+
+    await sleep(2500);
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main — full registration flow
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function main() {
+  log('MAIN', `WhatsApp registration starting for ${PHONE}`);
+
+  if (!PHONE || !USER_ID || !WEBHOOK_URL || !WEBHOOK_SECRET) {
+    throw new Error(
+      'Missing env vars: PHONE_NUMBER, TELEGRAM_USER_ID, WEBHOOK_URL, WEBHOOK_SECRET'
+    );
+  }
+
+  const phoneInfo = parsePhone(PHONE);
+  log('MAIN', `Phone parsed — country: ${phoneInfo.country}, cc: +${phoneInfo.countryCode}, national: ${phoneInfo.nationalNumber}`);
+
+  // ── 1. Wait for emulator to finish booting ───────────────────────────────
+  log('MAIN', 'Waiting for emulator boot...');
+  await sleep(5000);
+  for (let i = 1; i <= 10; i++) {
+    const prop = adbShell('getprop sys.boot_completed').trim();
+    log('BOOT', `sys.boot_completed = "${prop}" (attempt ${i}/10)`);
+    if (prop === '1') break;
+    if (i === 10) throw new Error('Emulator boot timed out');
+    await sleep(6000);
+  }
+  log('BOOT', 'Emulator ready');
+
+  // ── 2. Unlock screen ─────────────────────────────────────────────────────
+  await unlockScreen();
+
+  // ── 3. Install WhatsApp APK ──────────────────────────────────────────────
+  await installWhatsApp();
+
+  // ── 4. Grant permissions ─────────────────────────────────────────────────
+  keyevent('KEYCODE_HOME');
+  await sleep(1000);
+  await grantPermissions();
+
+  // ── 5. Launch WhatsApp ───────────────────────────────────────────────────
+  await launchWhatsApp();
+
+  // ── 6. Dismiss system dialogs ────────────────────────────────────────────
+  await dismissSystemDialogs();
+
+  // ── 7. Accept terms ──────────────────────────────────────────────────────
+  //   • Dump UI XML
+  //   • Find "AGREE AND CONTINUE" in the XML
+  //   • Extract bounds → calculate centre coordinates
+  //   • adb shell input tap cx cy
+  await acceptTerms();
+
+  // ── 8. Phone number screen ───────────────────────────────────────────────
+  //   • Dump UI XML  (adb shell uiautomator dump /sdcard/view.xml)
+  //   • adb pull /sdcard/view.xml /tmp/view.xml
+  //   • Parse XML → find country code field → edit country code
+  //   • Parse XML → find phone number field → type national number
+  //   • Parse XML → find NEXT button → tap
+  await handlePhoneNumberScreen(phoneInfo.countryCode, phoneInfo.nationalNumber);
+
+  // ── 9. Confirm phone number dialog ───────────────────────────────────────
+  await confirmPhoneDialog();
+
+  // ── 10. Check for rate limit ─────────────────────────────────────────────
+  if (await checkRateLimit()) {
+    log('MAIN', 'Rate limited — exiting');
+    process.exit(0);
+  }
+
+  // ── 11. Notify bot: OTP has been requested ───────────────────────────────
+  await webhook('otp_requested');
+  log('MAIN', 'OTP requested — waiting for user reply on Telegram');
+
+  // ── 12. Poll bot for OTP ─────────────────────────────────────────────────
+  const otp = await pollForOtp();
+  if (!otp) {
+    log('MAIN', 'OTP not received in time');
+    await webhook('bad_number', { reason: 'OTP timeout — user did not reply' });
+    process.exit(0);
+  }
+
+  // ── 13. Enter OTP ────────────────────────────────────────────────────────
+  await enterOtp(otp);
+
+  // ── 14. Skip setup screens → confirm chat list ───────────────────────────
+  const complete = await skipSetupScreens();
+
+  if (complete) {
+    log('MAIN', 'Registration complete!');
+    await webhook('registration_complete');
+  } else {
+    const finalXml = await dumpUI();
+    if (finalXml.includes('Chats') || finalXml.includes('NEW CHAT')) {
+      log('MAIN', 'Chat list visible — registration complete');
+      await webhook('registration_complete');
+    } else if (finalXml.includes('invalid') || finalXml.includes('incorrect')) {
+      log('MAIN', 'OTP rejected');
+      await webhook('bad_number', { reason: 'Invalid OTP entered' });
+    } else {
+      const finalTexts = await logScreen('FINAL');
+      log('MAIN', `Uncertain final state: ${finalTexts.join(' | ')}`);
+      await webhook('registration_complete', { note: 'Uncertain final state' });
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Entry point
+// ─────────────────────────────────────────────────────────────────────────────
 
 main().catch(async (err) => {
   log('ERROR', err.message);
-  log('ERROR', err.stack);
-  await webhook('bad_number', { reason: `Script error: ${err.message}` });
-  process.exit(0); // exit 0 — bot already notified, skip if:failure() step
+  log('ERROR', err.stack || '(no stack)');
+  try { await webhook('bad_number', { reason: `Script error: ${err.message}` }); } catch (_) {}
+  process.exit(0);
 });
