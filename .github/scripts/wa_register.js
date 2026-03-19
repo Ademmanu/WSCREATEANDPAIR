@@ -1,883 +1,745 @@
+#!/usr/bin/env node
 /**
- * wa_register.js — WhatsApp Mobile Registration Automation
- * Uses ONLY ADB + UIAutomator XML parsing
- * No Puppeteer - pure ADB automation
+ * wa_register.js
+ * WhatsApp registration automation for GitHub Actions Android Emulator
+ * Uses ADB + UIAutomator XML parsing to drive the WhatsApp UI
  */
 
-const axios = require('axios');
 const { execSync, spawn } = require('child_process');
 const fs = require('fs');
-const xml2js = require('xml2js');
+const path = require('path');
+const axios = require('axios');
+const { parseStringPromise } = require('xml2js');
 
 // ── Configuration ────────────────────────────────────────────────────────────
-const PHONE_NUMBER = process.env.PHONE_NUMBER;
-const TELEGRAM_USER_ID = process.env.TELEGRAM_USER_ID;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
-const GITHUB_RUN_ID = process.env.GITHUB_RUN_ID;
-const NODE_PORT = process.env.NODE_PORT || '3001';
+const CONFIG = {
+  phoneNumber: process.env.PHONE_NUMBER || '',
+  telegramUserId: process.env.TELEGRAM_USER_ID || '',
+  webhookUrl: process.env.WEBHOOK_URL || '',
+  webhookSecret: process.env.WEBHOOK_SECRET || '',
+  githubRunId: process.env.GITHUB_RUN_ID || '',
+  apkPath: '/tmp/whatsapp.apk',
+  packageName: 'com.whatsapp',
+  activityName: 'com.whatsapp/.Main',
+  otpPollInterval: 5000,      // 5 seconds
+  otpTimeout: 15 * 60 * 1000, // 15 minutes (matches bot.py timeout)
+  uiPollInterval: 2000,       // 2 seconds
+  maxRetries: 3,
+};
 
-const POLL_INTERVAL = 3000;
-const MAX_TOTAL_TIME = 15 * 60 * 1000; // 15 minutes total
-const MAX_OTP_ATTEMPTS = 3;
-const ADB_TIMEOUT = 120000; // 2 minutes for ADB commands
-
-// ── State ─────────────────────────────────────────────────────────────────────
-let otpAttempts = 0;
-let startTime = Date.now();
-let currentXml = '';
-
-// ── Logging ───────────────────────────────────────────────────────────────────
-function log(level, message, data) {
+// ── Logger ───────────────────────────────────────────────────────────────────
+function log(level, ...args) {
   const timestamp = new Date().toISOString();
-  const dataStr = data ? ' | Data: ' + JSON.stringify(data) : '';
-  console.log(`[${timestamp}] [${level}] ${message}${dataStr}`);
+  console.log(`[${timestamp}] [${level}]`, ...args);
 }
 
-function postAction(action, details) {
-  log('POST', `[${action}] ${details}`);
-}
-
-// ── Webhook ──────────────────────────────────────────────────────────────────
-async function sendWebhook(event, extra = {}) {
-  try {
-    const payload = {
-      event,
-      phone_number: PHONE_NUMBER,
-      telegram_user_id: parseInt(TELEGRAM_USER_ID),
-      run_id: GITHUB_RUN_ID,
-      ...extra
-    };
-
-    const response = await axios.post(WEBHOOK_URL, payload, {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Webhook-Secret': WEBHOOK_SECRET
-      },
-      timeout: 10000
-    });
-
-    log('INFO', `Webhook sent: ${event}`, { status: response.status });
-    return true;
-  } catch (error) {
-    log('ERROR', `Webhook failed: ${event}`, { error: error.message });
-    return false;
+// ── ADB Helpers ──────────────────────────────────────────────────────────────
+class ADBHelper {
+  constructor() {
+    this.deviceId = null;
   }
-}
 
-// ── OTP Polling ──────────────────────────────────────────────────────────────
-async function pollForOtp() {
-  const url = `http://localhost:${NODE_PORT}/otp/${PHONE_NUMBER}`;
+  async waitForDevice(timeout = 120000) {
+    const start = Date.now();
+    log('INFO', 'Waiting for Android device...');
 
-  try {
-    const response = await axios.get(url, {
-      headers: { 'X-Webhook-Secret': WEBHOOK_SECRET },
-      timeout: 5000
-    });
+    while (Date.now() - start < timeout) {
+      try {
+        const result = execSync('adb devices', { encoding: 'utf8' });
+        const lines = result.trim().split('\n').slice(1);
+        const device = lines.find(line => line.includes('device') && !line.includes('List'));
 
-    if (response.status === 200 && response.data) {
-      return response.data.trim();
+        if (device) {
+          this.deviceId = device.split('\t')[0];
+          log('INFO', `Device found: ${this.deviceId}`);
+
+          // Wait for boot completion
+          execSync('adb wait-for-device');
+          let bootCompleted = false;
+          while (!bootCompleted) {
+            try {
+              const boot = execSync('adb shell getprop sys.boot_completed', { encoding: 'utf8' }).trim();
+              if (boot === '1') {
+                bootCompleted = true;
+                log('INFO', 'Device boot completed');
+              }
+            } catch (e) {
+              // ignore
+            }
+            if (!bootCompleted) await this.sleep(1000);
+          }
+          return;
+        }
+      } catch (e) {
+        // ignore
+      }
+      await this.sleep(1000);
     }
-  } catch (error) {
-    if (error.response && error.response.status === 204) {
+    throw new Error('Device not found within timeout');
+  }
+
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  exec(cmd, timeout = 30000) {
+    try {
+      return execSync(cmd, { encoding: 'utf8', timeout, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) {
+      throw new Error(`ADB command failed: ${cmd} - ${e.message}`);
+    }
+  }
+
+  async shell(cmd, timeout = 30000) {
+    return this.exec(`adb shell "${cmd}"`, timeout);
+  }
+
+  async dumpUI() {
+    const dumpPath = '/sdcard/ui_dump.xml';
+    const localPath = '/tmp/ui_dump.xml';
+
+    try {
+      // Dump UI hierarchy
+      await this.shell(`uiautomator dump ${dumpPath}`, 10000);
+      await this.sleep(500);
+
+      // Pull to local
+      this.exec(`adb pull ${dumpPath} ${localPath}`, 10000);
+
+      // Read and parse XML
+      const xmlContent = fs.readFileSync(localPath, 'utf8');
+      const parsed = await parseStringPromise(xmlContent);
+      return parsed;
+    } catch (e) {
+      log('WARN', `UI dump failed: ${e.message}`);
       return null;
     }
-    log('WARN', 'OTP poll error', { error: error.message });
   }
-  return null;
-}
 
-// ── ADB Commands ─────────────────────────────────────────────────────────────
-function execAdb(command, timeout = ADB_TIMEOUT) {
-  try {
-    log('ADB', `Executing: ${command.substring(0, 100)}...`);
-    const result = execSync(`adb ${command}`, { 
-      encoding: 'utf8', 
-      timeout: timeout,
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    return result.trim();
-  } catch (e) {
-    log('ERROR', `ADB command failed: ${command.substring(0, 100)}`, { 
-      error: e.message,
-      stderr: e.stderr?.toString(),
-      stdout: e.stdout?.toString()
-    });
-    throw e;
-  }
-}
+  async findElement(parsedXml, options) {
+    if (!parsedXml || !parsedXml.hierarchy || !parsedXml.hierarchy.node) {
+      return null;
+    }
 
-function execAdbBackground(command) {
-  const parts = command.split(' ');
-  const proc = spawn('adb', parts, { detached: true, stdio: 'ignore' });
-  proc.unref();
-  return proc;
-}
+    const nodes = this.flattenNodes(parsedXml.hierarchy.node);
 
-// ── UI Actions ─────────────────────────────────────────────────────────────────
-async function dumpUi() {
-  try {
-    execAdb('shell uiautomator dump /sdcard/window_dump.xml', 10000);
-    await sleep(500);
-    const xml = execAdb('shell cat /sdcard/window_dump.xml', 10000);
-    currentXml = xml;
-    return xml;
-  } catch (e) {
-    log('WARN', 'UI dump failed', { error: e.message });
-    return '';
-  }
-}
+    for (const node of nodes) {
+      let match = true;
 
-function parseXmlBounds(boundsStr) {
-  // Parse [x1,y1][x2,y2] to center point
-  const match = boundsStr.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
-  if (!match) return null;
-  const x1 = parseInt(match[1]);
-  const y1 = parseInt(match[2]);
-  const x2 = parseInt(match[3]);
-  const y2 = parseInt(match[4]);
-  return {
-    x: Math.floor((x1 + x2) / 2),
-    y: Math.floor((y1 + y2) / 2),
-    x1, y1, x2, y2
-  };
-}
-
-async function findElementByText(text, partial = true) {
-  const xml = await dumpUi();
-  if (!xml) return null;
-
-  const parser = new xml2js.Parser({ explicitArray: false });
-
-  try {
-    const result = await parser.parseStringPromise(xml);
-    const nodes = [];
-
-    function traverse(node) {
-      if (!node) return;
-
-      if (node.$ && (node.$.text || node.$.contentDescription)) {
-        const nodeText = (node.$.text || node.$.contentDescription || '').toLowerCase();
-        const searchText = text.toLowerCase();
-
-        if (partial ? nodeText.includes(searchText) : nodeText === searchText) {
-          const coords = parseXmlBounds(node.$.bounds);
-          if (coords) {
-            nodes.push({
-              text: node.$.text || node.$.contentDescription,
-              class: node.$.class,
-              clickable: node.$.clickable === 'true',
-              enabled: node.$.enabled !== 'false',
-              ...coords
-            });
-          }
-        }
+      if (options.text && node.text && node.text[0].includes(options.text)) {
+        // text match
+      } else if (options.text) {
+        match = false;
       }
 
-      // Traverse children
-      Object.keys(node).forEach(key => {
-        if (key !== '$' && node[key]) {
-          if (Array.isArray(node[key])) {
-            node[key].forEach(child => traverse(child));
-          } else {
-            traverse(node[key]);
-          }
-        }
-      });
-    }
-
-    traverse(result.hierarchy);
-    return nodes.length > 0 ? nodes[0] : null;
-  } catch (e) {
-    log('WARN', 'XML parse error', { error: e.message });
-    return null;
-  }
-}
-
-async function findElementByClass(className) {
-  const xml = await dumpUi();
-  if (!xml) return null;
-
-  const parser = new xml2js.Parser({ explicitArray: false });
-
-  try {
-    const result = await parser.parseStringPromise(xml);
-    const nodes = [];
-
-    function traverse(node) {
-      if (!node) return;
-
-      if (node.$ && node.$.class && node.$.class.includes(className)) {
-        const coords = parseXmlBounds(node.$.bounds);
-        if (coords && node.$.clickable === 'true') {
-          nodes.push({
-            class: node.$.class,
-            text: node.$.text || node.$.contentDescription || '',
-            clickable: true,
-            enabled: node.$.enabled !== 'false',
-            ...coords
-          });
-        }
+      if (options.resourceId && node.resource_id && node.resource_id[0] === options.resourceId) {
+        // resource-id match
+      } else if (options.resourceId) {
+        match = false;
       }
 
-      Object.keys(node).forEach(key => {
-        if (key !== '$' && node[key]) {
-          if (Array.isArray(node[key])) {
-            node[key].forEach(child => traverse(child));
-          } else {
-            traverse(node[key]);
-          }
-        }
-      });
-    }
-
-    traverse(result.hierarchy);
-    return nodes.length > 0 ? nodes[0] : null;
-  } catch (e) {
-    log('WARN', 'XML parse error', { error: e.message });
-    return null;
-  }
-}
-
-async function findInputField() {
-  const xml = await dumpUi();
-  if (!xml) return null;
-
-  const parser = new xml2js.Parser({ explicitArray: false });
-
-  try {
-    const result = await parser.parseStringPromise(xml);
-    const nodes = [];
-
-    function traverse(node) {
-      if (!node) return;
-
-      const isEditText = node.$ && node.$.class && (
-        node.$.class.includes('EditText') || 
-        node.$.class.includes('TextInput') ||
-        node.$.class.includes('AutoCompleteTextView')
-      );
-
-      if (isEditText && node.$.focusable === 'true') {
-        const coords = parseXmlBounds(node.$.bounds);
-        if (coords) {
-          nodes.push({
-            class: node.$.class,
-            text: node.$.text || '',
-            hint: node.$.hint || '',
-            ...coords
-          });
-        }
+      if (options.contentDesc && node.content_desc && node.content_desc[0].includes(options.contentDesc)) {
+        // content-desc match
+      } else if (options.contentDesc) {
+        match = false;
       }
 
-      Object.keys(node).forEach(key => {
-        if (key !== '$' && node[key]) {
-          if (Array.isArray(node[key])) {
-            node[key].forEach(child => traverse(child));
-          } else {
-            traverse(node[key]);
-          }
-        }
-      });
-    }
+      if (options.className && node.class && node.class[0].includes(options.className)) {
+        // class match
+      } else if (options.className) {
+        match = false;
+      }
 
-    traverse(result.hierarchy);
-    return nodes.length > 0 ? nodes[0] : null;
-  } catch (e) {
-    log('WARN', 'XML parse error', { error: e.message });
+      if (match) return node;
+    }
     return null;
   }
-}
 
-// ── Actions ───────────────────────────────────────────────────────────────────
-async function tapElement(element, description) {
-  if (!element) {
-    log('WARN', `Cannot tap: element not found (${description})`);
-    return false;
-  }
-
-  const { x, y } = element;
-  postAction('TAP', `${description} at (${x}, ${y}) - Text: "${element.text || 'N/A'}"`);
-
-  try {
-    execAdb(`shell input tap ${x} ${y}`, 10000);
-    await sleep(500);
-    return true;
-  } catch (e) {
-    log('ERROR', `Tap failed for ${description}`, { error: e.message });
-    return false;
-  }
-}
-
-async function tapByText(text, description, partial = true) {
-  const element = await findElementByText(text, partial);
-  if (element) {
-    return await tapElement(element, description || text);
-  }
-  log('WARN', `Text not found: "${text}"`);
-  return false;
-}
-
-async function inputText(text, description) {
-  postAction('INPUT', `${description}: "${text}"`);
-
-  // Use input text command
-  const escaped = text.replace(/ /g, '\s').replace(/'/g, "\'").replace(/"/g, '\"');
-
-  try {
-    execAdb(`shell input text "${escaped}"`, 10000);
-    await sleep(300);
-    return true;
-  } catch (e) {
-    log('ERROR', `Input failed: ${description}`, { error: e.message });
-    return false;
-  }
-}
-
-async function clearInputField(element) {
-  if (!element) return false;
-
-  postAction('CLEAR', `Input field at (${element.x}, ${element.y})`);
-
-  // Tap to focus
-  await tapElement(element, 'input field');
-  await sleep(200);
-
-  // Select all and delete
-  execAdb('shell input keyevent --longpress 29 29 29', 5000); // Ctrl+A
-  await sleep(200);
-  execAdb('shell input keyevent 67', 5000); // Delete
-  await sleep(200);
-
-  return true;
-}
-
-async function pressKey(keycode, description) {
-  postAction('KEY', `${description} (keycode ${keycode})`);
-  try {
-    execAdb(`shell input keyevent ${keycode}`, 5000);
-    await sleep(300);
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ── WhatsApp Installation ─────────────────────────────────────────────────────
-async function installWhatsApp() {
-  log('INFO', '=== Installing WhatsApp ===');
-
-  const apkPath = '/tmp/whatsapp.apk';
-  if (!fs.existsSync(apkPath)) {
-    throw new Error(`WhatsApp APK not found at ${apkPath}`);
-  }
-
-  // Check if already installed
-  try {
-    const packages = execAdb('shell pm list packages com.whatsapp', 10000);
-    if (packages.includes('com.whatsapp')) {
-      log('INFO', 'WhatsApp already installed, clearing data for fresh start');
-      execAdb('shell pm clear com.whatsapp', 30000);
-      await sleep(3000);
-      return;
+  flattenNodes(node, result = []) {
+    if (Array.isArray(node)) {
+      for (const n of node) this.flattenNodes(n, result);
+    } else if (node && typeof node === 'object') {
+      result.push(node);
+      if (node.node) {
+        this.flattenNodes(node.node, result);
+      }
     }
-  } catch (e) {
-    // Not installed, continue
+    return result;
   }
 
-  // Install with long timeout
-  log('INFO', 'Installing APK (this may take a minute)...');
-  try {
-    // Use install-multiple for better handling of large APKs
-    execAdb(`install -r -d ${apkPath}`, 300000); // 5 minute timeout
+  async getBounds(node) {
+    const bounds = node.bounds ? node.bounds[0] : '[0,0][0,0]';
+    const match = bounds.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+    if (!match) return { x: 0, y: 0 };
+    const x1 = parseInt(match[1]), y1 = parseInt(match[2]);
+    const x2 = parseInt(match[3]), y2 = parseInt(match[4]);
+    return { x: Math.floor((x1 + x2) / 2), y: Math.floor((y1 + y2) / 2) };
+  }
+
+  async clickElement(node) {
+    const { x, y } = await this.getBounds(node);
+    await this.shell(`input tap ${x} ${y}`);
+    log('DEBUG', `Clicked at (${x}, ${y})`);
+  }
+
+  async inputText(text) {
+    // Escape special characters for adb shell
+    const escaped = text.replace(/"/g, '\"');
+    await this.shell(`input text "${escaped}"`);
+  }
+
+  async clearText() {
+    // Select all and delete
+    await this.shell('input keyevent 29'); // KEYCODE_A (select all in some contexts)
+    await this.shell('input keyevent 123'); // Move to end
+    for (let i = 0; i < 20; i++) {
+      await this.shell('input keyevent 67'); // KEYCODE_DEL
+    }
+  }
+
+  async pressBack() {
+    await this.shell('input keyevent 4'); // KEYCODE_BACK
+  }
+
+  async pressEnter() {
+    await this.shell('input keyevent 66'); // KEYCODE_ENTER
+  }
+
+  async installApk(apkPath) {
+    log('INFO', `Installing APK: ${apkPath}`);
+    if (!fs.existsSync(apkPath)) {
+      throw new Error(`APK not found: ${apkPath}`);
+    }
+    this.exec(`adb install -r -d ${apkPath}`, 120000);
     log('INFO', 'APK installed successfully');
-    await sleep(5000);
-  } catch (e) {
-    log('ERROR', 'APK installation failed', { error: e.message });
-    throw e;
   }
-}
 
-async function grantPermissions() {
-  log('INFO', 'Granting permissions');
-  const perms = [
-    'android.permission.READ_SMS',
-    'android.permission.RECEIVE_SMS',
-    'android.permission.READ_PHONE_STATE',
-    'android.permission.READ_CONTACTS',
-    'android.permission.CAMERA',
-    'android.permission.RECORD_AUDIO',
-    'android.permission.READ_EXTERNAL_STORAGE',
-    'android.permission.WRITE_EXTERNAL_STORAGE'
-  ];
-
-  for (const perm of perms) {
-    try {
-      execAdb(`shell pm grant com.whatsapp ${perm}`, 5000);
-    } catch (e) {
-      // Ignore individual permission failures
-    }
+  async launchApp(packageName, activityName) {
+    log('INFO', `Launching ${packageName}`);
+    await this.shell(`am start -n ${activityName}`);
+    await this.sleep(3000);
   }
-  await sleep(1000);
-}
 
-async function launchWhatsApp() {
-  log('INFO', '=== Launching WhatsApp ===');
+  async forceStop(packageName) {
+    log('INFO', `Force stopping ${packageName}`);
+    await this.shell(`am force-stop ${packageName}`);
+  }
 
-  // Try different launch methods
-  const attempts = [
-    'shell am start -n com.whatsapp/.Main',
-    'shell am start -n com.whatsapp/com.whatsapp.Main',
-    'shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.whatsapp/.Main',
-    'shell monkey -p com.whatsapp -c android.intent.category.LAUNCHER 1'
-  ];
-
-  for (const cmd of attempts) {
-    try {
-      log('INFO', `Trying launch: ${cmd}`);
-      execAdb(cmd, 15000);
-      await sleep(4000);
-
-      // Check if running
-      const activities = execAdb('shell dumpsys activity activities | grep -i whatsapp', 10000);
-      if (activities && activities.length > 10) {
-        log('INFO', 'WhatsApp launched successfully');
-        return true;
+  async grantPermissions(packageName) {
+    log('INFO', 'Granting permissions');
+    const perms = [
+      'android.permission.READ_CONTACTS',
+      'android.permission.WRITE_CONTACTS',
+      'android.permission.READ_PHONE_STATE',
+      'android.permission.READ_SMS',
+      'android.permission.RECEIVE_SMS',
+      'android.permission.READ_EXTERNAL_STORAGE',
+      'android.permission.WRITE_EXTERNAL_STORAGE',
+    ];
+    for (const perm of perms) {
+      try {
+        await this.shell(`pm grant ${packageName} ${perm}`);
+      } catch (e) {
+        // ignore permission grant failures
       }
+    }
+  }
+}
+
+// ── Webhook Client ───────────────────────────────────────────────────────────
+class WebhookClient {
+  async send(event, extra = {}) {
+    const payload = {
+      event,
+      phone_number: CONFIG.phoneNumber,
+      telegram_user_id: parseInt(CONFIG.telegramUserId),
+      run_id: CONFIG.githubRunId,
+      ...extra,
+    };
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-Webhook-Secret': CONFIG.webhookSecret,
+    };
+
+    try {
+      log('INFO', `Sending webhook: ${event}`);
+      const response = await axios.post(CONFIG.webhookUrl, payload, {
+        headers,
+        timeout: 10000,
+      });
+      log('INFO', `Webhook sent: ${response.status}`);
+      return true;
     } catch (e) {
-      log('WARN', `Launch attempt failed: ${e.message}`);
+      log('ERROR', `Webhook failed: ${e.message}`);
+      return false;
     }
   }
 
-  throw new Error('Failed to launch WhatsApp after all attempts');
-}
-
-// ── Screen Detection ──────────────────────────────────────────────────────────
-async function detectScreen() {
-  const xml = await dumpUi();
-  if (!xml) return 'UNKNOWN';
-
-  const lowerXml = xml.toLowerCase();
-
-  // Check for specific screens
-  if (lowerXml.includes('agree') && lowerXml.includes('continue')) return 'WELCOME';
-  if (lowerXml.includes('phone number') || lowerXml.includes('verify your phone')) return 'PHONE_ENTRY';
-  if (lowerXml.includes('6-digit') || lowerXml.includes('verification code') || lowerXml.includes('enter code')) return 'OTP';
-  if (lowerXml.includes('already registered') || lowerXml.includes('active on another device')) return 'ALREADY_REGISTERED';
-  if (lowerXml.includes('try again later') || lowerXml.includes('too many attempts')) return 'RATE_LIMITED';
-  if (lowerXml.includes('invalid phone number') || lowerXml.includes('not a valid')) return 'BAD_NUMBER';
-  if (lowerXml.includes('banned') || lowerXml.includes('suspended')) return 'BANNED';
-  if (lowerXml.includes('two-step') || lowerXml.includes('enter pin')) return 'TWO_STEP';
-  if (lowerXml.includes('your name') || lowerXml.includes('profile info')) return 'PROFILE_SETUP';
-  if (lowerXml.includes('chats') && lowerXml.includes('calls')) return 'LOGGED_IN';
-  if (lowerXml.includes('connecting') || lowerXml.includes('loading')) return 'LOADING';
-
-  return 'UNKNOWN';
-}
-
-function extractWaitTime(xml) {
-  const lowerXml = xml.toLowerCase();
-  const hourMatch = lowerXml.match(/(\d+)\s*hour/);
-  const minMatch = lowerXml.match(/(\d+)\s*minute/);
-  const secMatch = lowerXml.match(/(\d+)\s*second/);
-
-  let seconds = 600; // Default 10 minutes
-  if (hourMatch) seconds = parseInt(hourMatch[1]) * 3600;
-  else if (minMatch) seconds = parseInt(minMatch[1]) * 60;
-  else if (secMatch) seconds = parseInt(secMatch[1]);
-
-  return seconds;
-}
-
-// ── Flow Handlers ──────────────────────────────────────────────────────────────
-async function handleWelcomeScreen() {
-  log('INFO', '=== Handling Welcome Screen ===');
-
-  // Wait for screen to appear
-  let attempts = 0;
-  while (attempts < 10) {
-    const screen = await detectScreen();
-    if (screen === 'WELCOME') break;
-    if (screen === 'PHONE_ENTRY') return true; // Already past welcome
-    await sleep(1000);
-    attempts++;
-  }
-
-  // Tap Agree and Continue
-  const tapped = await tapByText('Agree and continue', 'Agree and Continue button');
-  if (!tapped) {
-    // Try coordinates fallback
-    postAction('TAP', 'Agree button fallback at (540, 2000)');
-    execAdb('shell input tap 540 2000', 5000);
-  }
-
-  await sleep(3000);
-
-  // Handle any confirmation dialogs
-  await tapByText('Continue', 'Continue button', true);
-  await tapByText('OK', 'OK button', true);
-
-  return true;
-}
-
-async function handlePhoneEntry() {
-  log('INFO', '=== Handling Phone Number Entry ===');
-
-  // Wait for phone entry screen
-  let attempts = 0;
-  while (attempts < 15) {
-    const screen = await detectScreen();
-    if (screen === 'PHONE_ENTRY') break;
-    await sleep(1000);
-    attempts++;
-  }
-
-  // Find and tap phone number field
-  const inputField = await findInputField();
-  if (inputField) {
-    await clearInputField(inputField);
-    await inputText(PHONE_NUMBER, 'Phone number');
-  } else {
-    // Fallback: tap center screen and type
-    postAction('TAP', 'Phone field fallback at (700, 1000)');
-    execAdb('shell input tap 700 1000', 5000);
-    await sleep(500);
-    await inputText(PHONE_NUMBER, 'Phone number');
-  }
-
-  await sleep(1000);
-
-  // Tap Next/Continue
-  const nextBtn = await findElementByText('Next', false) || 
-                  await findElementByText('Continue', false) ||
-                  await findElementByClass('Button');
-
-  if (nextBtn) {
-    await tapElement(nextBtn, 'Next/Continue button');
-  } else {
-    postAction('TAP', 'Next button fallback at (900, 2000)');
-    execAdb('shell input tap 900 2000', 5000);
-  }
-
-  await sleep(3000);
-
-  // Handle confirmation dialog
-  await tapByText('OK', 'OK confirmation', true);
-  await tapByText('Yes', 'Yes confirmation', true);
-
-  return true;
-}
-
-async function handleOtpFlow() {
-  log('INFO', '=== Handling OTP Verification ===');
-
-  // Check time remaining
-  const elapsed = Date.now() - startTime;
-  const remaining = MAX_TOTAL_TIME - elapsed;
-
-  if (remaining <= 0) {
-    throw new Error('OTP_TIMEOUT');
-  }
-
-  if (otpAttempts >= MAX_OTP_ATTEMPTS) {
-    throw new Error('OTP_EXHAUSTED');
-  }
-
-  otpAttempts++;
-  log('INFO', `OTP attempt ${otpAttempts}/${MAX_OTP_ATTEMPTS}`);
-
-  if (otpAttempts === 1) {
-    await sendWebhook('otp_requested');
-  }
-
-  // Poll for OTP
-  const otpStart = Date.now();
-  let otp = null;
-
-  while (Date.now() - otpStart < remaining && Date.now() - startTime < MAX_TOTAL_TIME) {
-    otp = await pollForOtp();
-    if (otp) break;
-    process.stdout.write('.');
-    await sleep(POLL_INTERVAL);
-  }
-
-  if (!otp) {
-    throw new Error('OTP_TIMEOUT');
-  }
-
-  log('INFO', 'OTP received from user');
-
-  // Validate
-  if (!/^\d{6}$/.test(otp)) {
-    await sendWebhook('otp_error', { reason: 'Invalid OTP format' });
-    return false;
-  }
-
-  // Find OTP field and enter
-  const otpField = await findInputField();
-  if (otpField) {
-    await tapElement(otpField, 'OTP input field');
-    await clearInputField(otpField);
-    await inputText(otp, 'OTP code');
-  } else {
-    // Fallback
-    postAction('TAP', 'OTP field fallback at (540, 1000)');
-    execAdb('shell input tap 540 1000', 5000);
-    await inputText(otp, 'OTP code');
-  }
-
-  await sleep(5000);
-
-  // Check result
-  const screen = await detectScreen();
-
-  if (screen === 'PROFILE_SETUP' || screen === 'LOGGED_IN') {
-    log('INFO', 'OTP accepted');
-    await sendWebhook('registered');
-    return true;
-  } else if (screen === 'OTP') {
-    // Wrong OTP
-    log('WARN', 'OTP rejected');
-    await sendWebhook('otp_error', { 
-      attempt: otpAttempts, 
-      remaining: MAX_OTP_ATTEMPTS - otpAttempts 
-    });
-
-    if (otpAttempts < MAX_OTP_ATTEMPTS) {
-      // Clear field and retry
-      const field = await findInputField();
-      if (field) await clearInputField(field);
-      return await handleOtpFlow(); // Retry
-    }
-    return false;
-  }
-
-  return false;
-}
-
-async function handleTakeover() {
-  log('INFO', '=== Handling Already Registered - Attempting Takeover ===');
-
-  // Look for SMS verification option
-  const smsOption = await findElementByText('Verify by SMS', true) ||
-                    await findElementByText('Send SMS', true) ||
-                    await findElementByText('Text message', true);
-
-  if (smsOption) {
-    log('INFO', 'Found SMS verification option');
-    await tapElement(smsOption, 'SMS verification option');
-    await sleep(3000);
-
-    const screen = await detectScreen();
-    if (screen === 'OTP') {
-      return true; // Can proceed with SMS
-    }
-  }
-
-  // Check for QR code (no SMS option)
-  const hasQr = currentXml.toLowerCase().includes('qr code') ||
-                currentXml.toLowerCase().includes('scan');
-
-  if (hasQr) {
-    log('INFO', 'Only QR pairing available, SMS takeover not possible');
-    return false;
-  }
-
-  // Try tapping "Use this phone" if present
-  const useThisPhone = await findElementByText('Use this phone', true);
-  if (useThisPhone) {
-    await tapElement(useThisPhone, 'Use this phone option');
-    await sleep(3000);
-
-    const screen = await detectScreen();
-    return screen === 'OTP';
-  }
-
-  return false;
-}
-
-async function handleProfileSetup() {
-  log('INFO', '=== Handling Profile Setup ===');
-
-  await sleep(2000);
-
-  // Enter name
-  const nameField = await findInputField();
-  if (nameField) {
-    await tapElement(nameField, 'Name input field');
-    await clearInputField(nameField);
-    await inputText('WSCREATE', 'Profile name');
-    await sleep(500);
-  }
-
-  // Tap Next
-  const nextBtn = await findElementByText('Next', false) ||
-                  await findElementByClass('Button');
-  if (nextBtn) {
-    await tapElement(nextBtn, 'Next button');
-  }
-
-  await sleep(2000);
-
-  // Skip photo if prompted
-  const skipBtn = await findElementByText('Skip', true);
-  if (skipBtn) {
-    await tapElement(skipBtn, 'Skip photo button');
-  }
-
-  await sleep(2000);
-
-  // Handle any additional screens
-  await tapByText('Next', 'Next button', true);
-  await tapByText('Continue', 'Continue button', true);
-
-  log('INFO', 'Profile setup complete');
-  await sendWebhook('registered');
-  return true;
-}
-
-// ── Main Flow ─────────────────────────────────────────────────────────────────
-async function main() {
-  log('INFO', '=== WhatsApp Registration Automation Started ===');
-  log('INFO', 'Configuration', {
-    phone: PHONE_NUMBER,
-    userId: TELEGRAM_USER_ID,
-    maxOtpAttempts: MAX_OTP_ATTEMPTS,
-    timeoutMinutes: MAX_TOTAL_TIME / 60000
-  });
-
-  startTime = Date.now();
-
-  // Wait for emulator
-  await sleep(5000);
-
-  // Install and launch
-  await installWhatsApp();
-  await grantPermissions();
-  await launchWhatsApp();
-
-  // Registration flow
-  await handleWelcomeScreen();
-  await handlePhoneEntry();
-
-  // State machine
-  let checks = 0;
-  const maxChecks = 60;
-
-  while (checks < maxChecks) {
-    checks++;
-
-    if (Date.now() - startTime >= MAX_TOTAL_TIME) {
-      throw new Error('OTP_TIMEOUT');
-    }
-
-    const screen = await detectScreen();
-    log('INFO', `Current screen: ${screen}`);
-
-    switch (screen) {
-      case 'OTP':
-        const success = await handleOtpFlow();
-        if (success) {
-          await handleProfileSetup();
-          log('INFO', '=== Registration Complete ===');
-          return;
+  async pollForOtp() {
+    const otpUrl = CONFIG.webhookUrl.replace('/webhook/event', `/otp/${CONFIG.phoneNumber}`);
+    const headers = { 'X-Webhook-Secret': CONFIG.webhookSecret };
+    const startTime = Date.now();
+
+    log('INFO', 'Starting OTP poll...');
+
+    while (Date.now() - startTime < CONFIG.otpTimeout) {
+      try {
+        const response = await axios.get(otpUrl, { headers, timeout: 5000 });
+        if (response.status === 200 && response.data) {
+          const otp = response.data.trim();
+          if (/^\d{6}$/.test(otp)) {
+            log('INFO', `OTP received: ${otp}`);
+            return otp;
+          }
         }
-        break;
-
-      case 'ALREADY_REGISTERED':
-        const canTakeover = await handleTakeover();
-        if (!canTakeover) {
-          await sendWebhook('already_registered');
-          log('INFO', 'Takeover not possible, reporting already registered');
-          return;
+      } catch (e) {
+        if (e.response && e.response.status === 204) {
+          // OTP not ready yet, continue polling
+        } else {
+          log('WARN', `OTP poll error: ${e.message}`);
         }
-        break;
+      }
+      await new Promise(r => setTimeout(r, CONFIG.otpPollInterval));
+    }
 
-      case 'RATE_LIMITED':
-        const waitSeconds = extractWaitTime(currentXml);
-        await sendWebhook('rate_limited', { wait_seconds: waitSeconds });
-        throw new Error(`RATE_LIMITED: ${waitSeconds}s`);
+    throw new Error('OTP polling timeout');
+  }
+}
 
-      case 'BAD_NUMBER':
-        await sendWebhook('bad_number', { reason: 'Invalid phone number' });
-        throw new Error('BAD_NUMBER');
+// ── Registration Flow ────────────────────────────────────────────────────────
+class RegistrationFlow {
+  constructor(adb, webhook) {
+    this.adb = adb;
+    this.webhook = webhook;
+    this.attempts = 0;
+  }
 
-      case 'BANNED':
-        await sendWebhook('banned');
-        throw new Error('NUMBER_BANNED');
+  async run() {
+    try {
+      // Parse phone number
+      const { countryCode, nationalNumber } = this.parsePhoneNumber(CONFIG.phoneNumber);
+      log('INFO', `Parsed phone: +${countryCode} ${nationalNumber}`);
 
-      case 'TWO_STEP':
-        await sendWebhook('bad_number', { reason: 'Two-step verification required' });
-        throw new Error('TWO_STEP_REQUIRED');
+      // Install and launch
+      await this.adb.installApk(CONFIG.apkPath);
+      await this.adb.grantPermissions(CONFIG.packageName);
+      await this.adb.launchApp(CONFIG.packageName, CONFIG.activityName);
 
-      case 'PROFILE_SETUP':
-        await handleProfileSetup();
-        return;
+      // Wait for initial load
+      await this.adb.sleep(5000);
 
-      case 'LOGGED_IN':
-        await sendWebhook('registered');
-        return;
+      // Registration state machine
+      let state = 'START';
+      let otp = null;
+      let attempts = 0;
 
-      case 'LOADING':
-      case 'WELCOME':
-      case 'PHONE_ENTRY':
-        log('INFO', 'Waiting for transition...');
-        await sleep(3000);
-        break;
+      while (attempts < 100) { // Max 100 UI checks (~3-4 minutes)
+        attempts++;
+        log('INFO', `State: ${state}, Attempt: ${attempts}`);
 
-      case 'UNKNOWN':
-      default:
-        log('WARN', 'Unknown screen, waiting...');
-        await sleep(3000);
+        const ui = await this.adb.dumpUI();
+
+        if (!ui) {
+          await this.adb.sleep(CONFIG.uiPollInterval);
+          continue;
+        }
+
+        // Detect current screen and act
+        const detectedState = await this.detectState(ui);
+
+        if (detectedState) {
+          log('INFO', `Detected screen: ${detectedState}`);
+
+          switch (detectedState) {
+            case 'WELCOME':
+              await this.handleWelcome(ui);
+              state = 'PHONE_INPUT';
+              break;
+
+            case 'PHONE_INPUT':
+              await this.handlePhoneInput(ui, countryCode, nationalNumber);
+              state = 'PHONE_CONFIRM';
+              break;
+
+            case 'PHONE_CONFIRM':
+              await this.handlePhoneConfirm(ui);
+              state = 'OTP_WAIT';
+              break;
+
+            case 'OTP_INPUT':
+              if (state !== 'OTP_WAIT' && state !== 'OTP_INPUT') {
+                // First time seeing OTP screen, notify bot
+                await this.webhook.send('otp_requested', { run_id: CONFIG.githubRunId });
+                state = 'OTP_WAIT';
+              }
+
+              if (!otp) {
+                try {
+                  otp = await this.webhook.pollForOtp();
+                } catch (e) {
+                  log('ERROR', `OTP wait failed: ${e.message}`);
+                  throw new Error('OTP_TIMEOUT');
+                }
+              }
+
+              if (otp) {
+                const success = await this.handleOtpInput(ui, otp);
+                if (success) {
+                  state = 'VERIFYING';
+                  otp = null; // Clear to prevent re-entry
+                }
+              }
+              break;
+
+            case 'ALREADY_REGISTERED':
+              await this.webhook.send('already_registered');
+              return { success: true, status: 'ALREADY_REGISTERED' };
+
+            case 'RATE_LIMITED':
+              const waitSeconds = await this.extractRateLimitTime(ui);
+              await this.webhook.send('rate_limited', { wait_seconds: waitSeconds });
+              return { success: false, status: 'RATE_LIMITED', waitSeconds };
+
+            case 'BANNED':
+              await this.webhook.send('banned');
+              return { success: false, status: 'BANNED' };
+
+            case 'INVALID_NUMBER':
+              await this.webhook.send('bad_number', { reason: 'Invalid phone number format' });
+              return { success: false, status: 'BAD_NUMBER' };
+
+            case 'OTP_ERROR':
+              await this.webhook.send('otp_error');
+              // Clear OTP and wait for retry
+              otp = null;
+              state = 'OTP_WAIT';
+              await this.adb.sleep(3000);
+              break;
+
+            case 'PROFILE_SETUP':
+              await this.handleProfileSetup(ui);
+              state = 'COMPLETING';
+              break;
+
+            case 'MAIN_SCREEN':
+            case 'CHATS_LIST':
+              await this.webhook.send('registered');
+              return { success: true, status: 'REGISTERED' };
+
+            case 'RESTORING':
+              log('INFO', 'Restoring chat history...');
+              await this.adb.sleep(5000);
+              break;
+
+            case 'PERMISSION_REQUEST':
+              await this.handlePermissionRequest(ui);
+              break;
+
+            default:
+              log('WARN', `Unknown state: ${detectedState}`);
+          }
+        }
+
+        await this.adb.sleep(CONFIG.uiPollInterval);
+      }
+
+      throw new Error('Max attempts reached without completion');
+
+    } catch (error) {
+      log('ERROR', `Registration failed: ${error.message}`);
+
+      if (error.message === 'OTP_TIMEOUT') {
+        await this.webhook.send('bad_number', { reason: 'OTP timeout - user did not respond in 15 minutes' });
+      } else {
+        await this.webhook.send('bad_number', { reason: error.message });
+      }
+
+      return { success: false, status: 'FAILED', error: error.message };
     }
   }
 
-  throw new Error('MAX_CHECKS_EXCEEDED');
-}
+  parsePhoneNumber(fullNumber) {
+    // Assume number starts with country code (e.g., 2348012345678)
+    // WhatsApp expects country code and national number separately
+    const cleaned = fullNumber.replace(/\D/g, '');
 
-// ── Error Handling ────────────────────────────────────────────────────────────
-async function handleError(error) {
-  log('ERROR', 'Registration failed', { 
-    error: error.message,
-    otpAttempts,
-    elapsedMs: Date.now() - startTime
-  });
+    // Common country code lengths
+    const countryCodes = ['1', '7', '20', '27', '30', '31', '32', '33', '34', '36', '39', '40', '41', '43', '44', '45', '46', '47', '48', '49', '51', '52', '53', '54', '55', '56', '57', '58', '60', '61', '62', '63', '64', '65', '66', '81', '82', '84', '86', '90', '91', '92', '93', '94', '95', '98', '211', '212', '213', '216', '218', '220', '221', '222', '223', '224', '225', '226', '227', '228', '229', '230', '231', '232', '233', '234', '235', '236', '237', '238', '239', '240', '241', '242', '243', '244', '245', '246', '247', '248', '249', '250', '251', '252', '253', '254', '255', '256', '257', '258', '260', '261', '262', '263', '264', '265', '266', '267', '268', '269', '290', '291', '297', '298', '299', '350', '351', '352', '353', '354', '355', '356', '357', '358', '359', '370', '371', '372', '373', '374', '375', '376', '377', '378', '379', '380', '381', '382', '383', '385', '386', '387', '389', '420', '421', '423', '500', '501', '502', '503', '504', '505', '506', '507', '508', '509', '590', '591', '592', '593', '594', '595', '596', '597', '598', '599', '670', '672', '673', '674', '675', '676', '677', '678', '679', '680', '681', '682', '683', '685', '686', '687', '688', '689', '690', '691', '692', '850', '852', '853', '855', '856', '880', '886', '960', '961', '962', '963', '964', '965', '966', '967', '968', '970', '971', '972', '973', '974', '975', '976', '977', '992', '993', '994', '995', '996', '998'];
 
-  let event = 'bad_number';
-  let reason = error.message;
+    for (const cc of countryCodes) {
+      if (cleaned.startsWith(cc)) {
+        return {
+          countryCode: cc,
+          nationalNumber: cleaned.substring(cc.length)
+        };
+      }
+    }
 
-  if (error.message.includes('OTP_TIMEOUT')) {
-    reason = 'OTP timeout - no code received within 15 minutes';
-  } else if (error.message.includes('OTP_EXHAUSTED')) {
-    event = 'otp_error';
-    reason = 'All 3 OTP attempts failed';
-  } else if (error.message.includes('RATE_LIMITED')) {
-    event = 'rate_limited';
-    const match = error.message.match(/(\d+)/);
+    // Default: assume first 1-3 digits are country code (fallback)
+    return {
+      countryCode: cleaned.substring(0, 3),
+      nationalNumber: cleaned.substring(3)
+    };
+  }
+
+  async detectState(ui) {
+    const xml = JSON.stringify(ui).toLowerCase();
+    const textNodes = this.extractAllTexts(ui);
+    const allText = textNodes.join(' ').toLowerCase();
+
+    // Check for specific indicators
+    if (allText.includes('agree and continue') || allText.includes('welcome to whatsapp')) {
+      return 'WELCOME';
+    }
+
+    if (allText.includes('verify your phone number') || 
+        (allText.includes('phone number') && allText.includes('country'))) {
+      if (allText.includes('verify') || allText.includes('next') || allText.includes('ok')) {
+        // Check if we're on the first screen or confirmation screen
+        if (allText.includes('edit') || allText.includes('number is') || allText.includes('confirm')) {
+          return 'PHONE_CONFIRM';
+        }
+        return 'PHONE_INPUT';
+      }
+    }
+
+    if (allText.includes('enter code') || allText.includes('verification code') || 
+        allText.includes('sms') || allText.includes('6-digit')) {
+      if (allText.includes('wrong') || allText.includes('invalid') || allText.includes('incorrect')) {
+        return 'OTP_ERROR';
+      }
+      return 'OTP_INPUT';
+    }
+
+    if (allText.includes('already registered') || allText.includes('already verified')) {
+      return 'ALREADY_REGISTERED';
+    }
+
+    if (allText.includes('banned') || allText.includes('temporarily banned') || 
+        allText.includes('suspended') || allText.includes('blocked')) {
+      return 'BANNED';
+    }
+
+    if (allText.includes('too many') || allText.includes('try again') || 
+        allText.includes('rate limit') || allText.includes('wait')) {
+      if (allText.includes('minutes') || allText.includes('hours')) {
+        return 'RATE_LIMITED';
+      }
+    }
+
+    if (allText.includes('invalid number') || allText.includes('not valid') ||
+        allText.includes('incorrect format')) {
+      return 'INVALID_NUMBER';
+    }
+
+    if (allText.includes('profile info') || allText.includes('your name') ||
+        allText.includes('display name')) {
+      return 'PROFILE_SETUP';
+    }
+
+    if (allText.includes('chats') && (allText.includes('calls') || allText.includes('status') || allText.includes('camera'))) {
+      return 'MAIN_SCREEN';
+    }
+
+    if (allText.includes('restoring') || allText.includes('backup')) {
+      return 'RESTORING';
+    }
+
+    if (allText.includes('allow') && allText.includes('permission')) {
+      return 'PERMISSION_REQUEST';
+    }
+
+    return null;
+  }
+
+  extractAllTexts(node, result = []) {
+    if (!node) return result;
+
+    if (typeof node === 'object') {
+      if (node.text && node.text[0]) {
+        result.push(node.text[0]);
+      }
+      if (node.node) {
+        for (const child of (Array.isArray(node.node) ? node.node : [node.node])) {
+          this.extractAllTexts(child, result);
+        }
+      }
+    }
+    return result;
+  }
+
+  async handleWelcome(ui) {
+    log('INFO', 'Handling Welcome screen');
+    const agreeBtn = await this.adb.findElement(ui, { text: 'Agree and continue' }) ||
+                     await this.adb.findElement(ui, { text: 'AGREE AND CONTINUE' });
+
+    if (agreeBtn) {
+      await this.adb.clickElement(agreeBtn);
+      await this.adb.sleep(2000);
+    } else {
+      // Fallback: click bottom center of screen where button usually is
+      await this.adb.shell('input tap 540 1800');
+    }
+  }
+
+  async handlePhoneInput(ui, countryCode, nationalNumber) {
+    log('INFO', `Entering phone number: +${countryCode} ${nationalNumber}`);
+
+    // Find country code field
+    const ccField = await this.adb.findElement(ui, { text: '+' }) ||
+                    await this.adb.findElement(ui, { resourceId: 'com.whatsapp:id/registration_cc' });
+
+    if (ccField) {
+      await this.adb.clickElement(ccField);
+      await this.adb.sleep(500);
+      await this.adb.clearText();
+      await this.adb.inputText(countryCode);
+      await this.adb.sleep(500);
+    }
+
+    // Find phone number field
+    const phoneField = await this.adb.findElement(ui, { text: 'phone number' }) ||
+                       await this.adb.findElement(ui, { resourceId: 'com.whatsapp:id/registration_phone' });
+
+    if (phoneField) {
+      await this.adb.clickElement(phoneField);
+      await this.adb.sleep(500);
+      await this.adb.clearText();
+      await this.adb.inputText(nationalNumber);
+      await this.adb.sleep(500);
+    }
+
+    // Click Next
+    const nextBtn = await this.adb.findElement(ui, { text: 'Next' }) ||
+                    await this.adb.findElement(ui, { text: 'NEXT' }) ||
+                    await this.adb.findElement(ui, { resourceId: 'com.whatsapp:id/registration_submit' });
+
+    if (nextBtn) {
+      await this.adb.clickElement(nextBtn);
+    } else {
+      // Fallback: press enter
+      await this.adb.pressEnter();
+    }
+
+    await this.adb.sleep(3000);
+  }
+
+  async handlePhoneConfirm(ui) {
+    log('INFO', 'Confirming phone number');
+    const okBtn = await this.adb.findElement(ui, { text: 'OK' }) ||
+                  await this.adb.findElement(ui, { text: 'Ok' }) ||
+                  await this.adb.findElement(ui, { text: 'YES' }) ||
+                  await this.adb.findElement(ui, { text: 'Yes' });
+
+    if (okBtn) {
+      await this.adb.clickElement(okBtn);
+      await this.adb.sleep(2000);
+    }
+  }
+
+  async handleOtpInput(ui, otp) {
+    log('INFO', `Entering OTP: ${otp}`);
+
+    // Find OTP input field
+    const otpField = await this.adb.findElement(ui, { text: 'code' }) ||
+                     await this.adb.findElement(ui, { resourceId: 'com.whatsapp:id/verify_sms_code_input' }) ||
+                     await this.adb.findElement(ui, { className: 'EditText' });
+
+    if (otpField) {
+      await this.adb.clickElement(otpField);
+      await this.adb.sleep(500);
+      await this.adb.clearText();
+      await this.adb.inputText(otp);
+      await this.adb.sleep(1000);
+
+      // Check if there's a submit button or if auto-submit happens
+      const nextBtn = await this.adb.findElement(ui, { text: 'Next' }) ||
+                      await this.adb.findElement(ui, { text: 'Verify' });
+      if (nextBtn) {
+        await this.adb.clickElement(nextBtn);
+      }
+
+      return true;
+    }
+
+    return false;
+  }
+
+  async extractRateLimitTime(ui) {
+    const texts = this.extractAllTexts(ui).join(' ');
+    const match = texts.match(/(\d+)\s*(minute|hour|min|hr)s?/i);
     if (match) {
-      await sendWebhook(event, { wait_seconds: parseInt(match[1]) });
-      return;
+      const num = parseInt(match[1]);
+      const unit = match[2].toLowerCase();
+      if (unit.includes('hour') || unit.includes('hr')) {
+        return num * 3600;
+      }
+      return num * 60;
     }
-  } else if (error.message.includes('BANNED')) {
-    event = 'banned';
-  } else if (error.message.includes('TWO_STEP')) {
-    reason = 'Two-step verification PIN required';
+    return 600; // default 10 minutes
   }
 
-  await sendWebhook(event, { reason });
+  async handleProfileSetup(ui) {
+    log('INFO', 'Setting up profile');
+
+    // Enter a default name or skip if possible
+    const nameField = await this.adb.findElement(ui, { text: 'name' }) ||
+                      await this.adb.findElement(ui, { className: 'EditText' });
+
+    if (nameField) {
+      await this.adb.clickElement(nameField);
+      await this.adb.sleep(500);
+      await this.adb.inputText('User');
+      await this.adb.sleep(500);
+    }
+
+    const nextBtn = await this.adb.findElement(ui, { text: 'Next' }) ||
+                    await this.adb.findElement(ui, { text: 'Done' });
+    if (nextBtn) {
+      await this.adb.clickElement(nextBtn);
+    }
+
+    await this.adb.sleep(3000);
+  }
+
+  async handlePermissionRequest(ui) {
+    log('INFO', 'Handling permission request');
+    const allowBtn = await this.adb.findElement(ui, { text: 'Allow' }) ||
+                     await this.adb.findElement(ui, { text: 'ALLOW' }) ||
+                     await this.adb.findElement(ui, { text: 'While using the app' });
+
+    if (allowBtn) {
+      await this.adb.clickElement(allowBtn);
+      await this.adb.sleep(1000);
+    } else {
+      await this.adb.pressBack();
+    }
+  }
 }
 
-// ── Entry Point ───────────────────────────────────────────────────────────────
-(async () => {
+// ── Main ─────────────────────────────────────────────────────────────────────
+async function main() {
+  log('INFO', '=== WhatsApp Registration Script Starting ===');
+  log('INFO', `Phone: ${CONFIG.phoneNumber}`);
+  log('INFO', `User: ${CONFIG.telegramUserId}`);
+
+  const adb = new ADBHelper();
+  const webhook = new WebhookClient();
+
   try {
-    await main();
-    process.exit(0);
+    await adb.waitForDevice();
+    const flow = new RegistrationFlow(adb, webhook);
+    const result = await flow.run();
+
+    log('INFO', `Registration completed: ${JSON.stringify(result)}`);
+    process.exit(result.success ? 0 : 1);
+
   } catch (error) {
-    await handleError(error);
+    log('FATAL', `Unhandled error: ${error.message}`);
+    await webhook.send('bad_number', { reason: `Fatal error: ${error.message}` });
     process.exit(1);
   }
-})();
+}
+
+main();
