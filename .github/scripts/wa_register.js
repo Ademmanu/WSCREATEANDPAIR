@@ -1,51 +1,44 @@
 /**
- * wa_register.js — WhatsApp Registration Automation Script
- * 
- * This script runs inside GitHub Actions with an Android emulator.
- * It automates the WhatsApp registration flow including:
- * - Phone number verification
- * - OTP (6-digit code) handling
- * - Pairing code linking
- * - Rate limit detection
- * - Account status detection (banned, restricted, already registered)
- * 
- * Communicates with the Telegram bot via webhooks.
+ * wa_register.js — WhatsApp Mobile Registration Automation
+ * Runs inside GitHub Actions Android Emulator
+ * Communicates with bot.py via webhooks and OTP polling endpoint
  */
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const puppeteer = require('puppeteer');
 const axios = require('axios');
+const { execSync, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-// ── Configuration from Environment ───────────────────────────────────────────
-const PHONE_NUMBER = process.env.PHONE_NUMBER;           // e.g., "2348012345678"
-const TELEGRAM_USER_ID = process.env.TELEGRAM_USER_ID;   // Telegram user ID
-const WEBHOOK_URL = process.env.WEBHOOK_URL;             // Bot webhook endpoint
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;       // Shared secret
-const GITHUB_RUN_ID = process.env.GITHUB_RUN_ID;         // GitHub Actions run ID
-const POLL_INTERVAL = 3000;                              // OTP poll interval (ms)
-const MAX_WAIT_TIME = 15 * 60 * 1000;                    // 15 minutes max wait
+// ── Configuration from environment ───────────────────────────────────────────
+const PHONE_NUMBER = process.env.PHONE_NUMBER;
+const TELEGRAM_USER_ID = process.env.TELEGRAM_USER_ID;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const GITHUB_RUN_ID = process.env.GITHUB_RUN_ID;
+const NODE_PORT = process.env.NODE_PORT || '3001';
+const POLL_INTERVAL = 3000; // 3 seconds
+const MAX_WAIT_TIME = 15 * 60 * 1000; // 15 minutes
 
-// ── State Management ─────────────────────────────────────────────────────────
-let client = null;
-let registrationState = 'INIT';  // INIT → PHONE_SUBMITTED → OTP_REQUESTED → OTP_SUBMITTED → COMPLETE/FAILED
-let otpResolved = false;
-let pairingResolved = false;
-let startTime = Date.now();
+// ── Logging ───────────────────────────────────────────────────────────────────
+function log(level, message, data = {}) {
+  const timestamp = new Date().toISOString();
+  const entry = { timestamp, level, message, ...data };
+  console.log(`[${timestamp}] [${level}] ${message}`, Object.keys(data).length ? JSON.stringify(data) : '');
+  return entry;
+}
 
-// ── Webhook Helper ────────────────────────────────────────────────────────────
-async function sendWebhook(event, extraData = {}) {
+// ── Webhook helpers ───────────────────────────────────────────────────────────
+async function sendWebhook(event, extra = {}) {
   try {
     const payload = {
       event,
       phone_number: PHONE_NUMBER,
-      telegram_user_id: TELEGRAM_USER_ID,
+      telegram_user_id: parseInt(TELEGRAM_USER_ID),
       run_id: GITHUB_RUN_ID,
-      ...extraData
+      ...extra
     };
-
-    console.log(`[WEBHOOK] Sending event: ${event}`, JSON.stringify(payload, null, 2));
-
+    
     const response = await axios.post(WEBHOOK_URL, payload, {
       headers: {
         'Content-Type': 'application/json',
@@ -53,649 +46,509 @@ async function sendWebhook(event, extraData = {}) {
       },
       timeout: 10000
     });
-
-    console.log(`[WEBHOOK] Success: ${response.status}`);
+    
+    log('INFO', `Webhook sent: ${event}`, { status: response.status });
     return true;
   } catch (error) {
-    console.error(`[WEBHOOK] Failed: ${error.message}`);
-    if (error.response) {
-      console.error(`[WEBHOOK] Response: ${error.response.status} - ${error.response.data}`);
-    }
+    log('ERROR', `Webhook failed: ${event}`, { error: error.message });
     return false;
   }
 }
 
 // ── OTP Polling ───────────────────────────────────────────────────────────────
 async function pollForOtp() {
-  const otpUrl = `${WEBHOOK_URL.replace('/webhook/event', '')}/otp/${PHONE_NUMBER}`;
-
-  console.log(`[OTP] Starting poll from: ${otpUrl}`);
-
-  while (!otpResolved && (Date.now() - startTime) < MAX_WAIT_TIME) {
-    try {
-      const response = await axios.get(otpUrl, {
-        headers: { 'X-Webhook-Secret': WEBHOOK_SECRET },
-        timeout: 5000
-      });
-
-      if (response.status === 200 && response.data) {
-        const otp = response.data.toString().trim();
-        console.log(`[OTP] Received OTP: ${otp}`);
-
-        if (/^\d{6}$/.test(otp)) {
-          await submitOtp(otp);
-          otpResolved = true;
-          return otp;
-        } else {
-          console.log(`[OTP] Invalid format, expected 6 digits`);
-        }
-      }
-    } catch (error) {
-      if (error.response && error.response.status === 204) {
-        // No OTP yet, continue polling
-      } else {
-        console.error(`[OTP] Poll error: ${error.message}`);
-      }
+  const url = `http://localhost:${NODE_PORT}/otp/${PHONE_NUMBER}`;
+  
+  try {
+    const response = await axios.get(url, {
+      headers: { 'X-Webhook-Secret': WEBHOOK_SECRET },
+      timeout: 5000
+    });
+    
+    if (response.status === 200 && response.data) {
+      return response.data.trim();
     }
-
-    await sleep(POLL_INTERVAL);
+  } catch (error) {
+    if (error.response && error.response.status === 204) {
+      return null; // Not ready yet
+    }
+    log('WARN', 'OTP poll error', { error: error.message });
   }
+  return null;
+}
 
-  if (!otpResolved) {
-    throw new Error('OTP timeout - no valid OTP received within 15 minutes');
+// ── Screenshot helper ─────────────────────────────────────────────────────────
+async function takeScreenshot(page, name) {
+  try {
+    const screenshotPath = `/tmp/screenshot_${name}_${Date.now()}.png`;
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    log('INFO', `Screenshot saved: ${screenshotPath}`);
+    return screenshotPath;
+  } catch (e) {
+    log('WARN', `Screenshot failed: ${e.message}`);
+    return null;
   }
 }
 
+// ── ADB Helpers ─────────────────────────────────────────────────────────────────
+function execAdb(command) {
+  try {
+    const result = execSync(`adb ${command}`, { encoding: 'utf8', timeout: 30000 });
+    return result.trim();
+  } catch (e) {
+    log('ERROR', `ADB command failed: ${command}`, { error: e.message });
+    throw e;
+  }
+}
+
+function tap(x, y) {
+  execAdb(`shell input tap ${x} ${y}`);
+}
+
+function inputText(text) {
+  // Escape special characters for shell
+  const escaped = text.replace(/ /g, '%s').replace(/'/g, '\\\'').replace(/"/g, '\\"');
+  execAdb(`shell input text "${escaped}"`);
+}
+
+function swipe(x1, y1, x2, y2, duration = 300) {
+  execAdb(`shell input swipe ${x1} ${y1} ${x2} ${y2} ${duration}`);
+}
+
+function pressBack() {
+  execAdb('shell input keyevent 4');
+}
+
+function pressEnter() {
+  execAdb('shell input keyevent 66');
+}
+
+// ── Wait helpers ────────────────────────────────────────────────────────────────
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ── OTP Submission ────────────────────────────────────────────────────────────
-async function submitOtp(otp) {
-  console.log(`[OTP] Submitting code: ${otp}`);
+async function waitForCondition(conditionFn, timeoutMs = 30000, intervalMs = 1000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await conditionFn()) return true;
+    await sleep(intervalMs);
+  }
+  return false;
+}
 
+// ── UI Detection via ADB UI Automator ─────────────────────────────────────────
+async function dumpUi() {
   try {
-    // Notify bot that OTP was submitted
-    await sendWebhook('otp_submitted', { otp: otp.replace(/\d(?=\d{2})/g, '*') });
-
-    // The actual OTP submission happens through the WhatsApp Web UI
-    // This is handled by the whatsapp-web.js library internally
-    // We just need to wait for the authentication result
-  } catch (error) {
-    console.error(`[OTP] Submit error: ${error.message}`);
-    throw error;
+    execAdb('shell uiautomator dump /sdcard/window_dump.xml');
+    const xml = execAdb('shell cat /sdcard/window_dump.xml');
+    return xml;
+  } catch (e) {
+    log('WARN', 'UI dump failed', { error: e.message });
+    return '';
   }
 }
 
-// ── WhatsApp Client Setup ────────────────────────────────────────────────────
-async function createWhatsAppClient() {
-  console.log(`[CLIENT] Creating WhatsApp client for ${PHONE_NUMBER}`);
-
-  const clientOptions = {
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process'
-      ],
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium'
-    },
-    authStrategy: new LocalAuth({ 
-      clientId: `reg_${PHONE_NUMBER}`,
-      dataPath: './.wwebjs_auth'
-    }),
-    // Important: Use the specific phone number for registration
-    takeoverOnConflict: false,
-    takeoverTimeoutMs: 0
-  };
-
-  client = new Client(clientOptions);
-
-  // ── Event Handlers ─────────────────────────────────────────────────────────
-
-  // QR Code generated (for pairing)
-  client.on('qr', async (qr) => {
-    console.log(`[QR] QR code generated (length: ${qr.length})`);
-    // For registration flow, we don't use QR - we use phone number + OTP
-    // But we capture this in case WhatsApp offers it as alternative
-  });
-
-  // Authentication successful
-  client.on('authenticated', async (session) => {
-    console.log(`[AUTH] Authentication successful for ${PHONE_NUMBER}`);
-    registrationState = 'AUTHENTICATED';
-
-    await sendWebhook('registered', { 
-      session_data: session,
-      timestamp: new Date().toISOString()
-    });
-  });
-
-  // Authentication failure
-  client.on('auth_failure', async (msg) => {
-    console.error(`[AUTH_FAIL] Authentication failed: ${msg}`);
-
-    // Determine failure type based on message
-    const lowerMsg = msg.toLowerCase();
-
-    if (lowerMsg.includes('banned') || lowerMsg.includes('blocked') || lowerMsg.includes('suspended')) {
-      await sendWebhook('banned', { reason: msg });
-    } else if (lowerMsg.includes('invalid') && lowerMsg.includes('code')) {
-      await sendWebhook('otp_error', { reason: msg });
-    } else {
-      await sendWebhook('bad_number', { reason: msg });
-    }
-
-    registrationState = 'FAILED';
-  });
-
-  // Client ready
-  client.on('ready', async () => {
-    console.log(`[READY] Client ready for ${PHONE_NUMBER}`);
-    registrationState = 'READY';
-
-    // Get session info
-    const info = client.info;
-    await sendWebhook('registered', {
-      wid: info.wid,
-      platform: info.platform,
-      connected_at: new Date().toISOString()
-    });
-
-    // Save session data
-    await saveSessionData();
-  });
-
-  // Disconnected
-  client.on('disconnected', async (reason) => {
-    console.warn(`[DISCONNECTED] Reason: ${reason}`);
-
-    const lowerReason = reason.toLowerCase();
-
-    if (lowerReason.includes('unpaired') || lowerReason.includes('logout')) {
-      await sendWebhook('restricted', { 
-        reason,
-        seconds_remaining: 0 
-      });
-    } else if (lowerReason.includes('conflict') || lowerReason.includes('replaced')) {
-      // Multi-device conflict
-      await sendWebhook('restricted', { 
-        reason,
-        seconds_remaining: 3600 
-      });
-    }
-
-    registrationState = 'DISCONNECTED';
-  });
-
-  // State changes
-  client.on('change_state', async (state) => {
-    console.log(`[STATE] Changed to: ${state}`);
-
-    if (state === 'CONFLICT' || state === 'UNLAUNCHED') {
-      await sendWebhook('restricted', { 
-        state,
-        seconds_remaining: 3600 
-      });
-    }
-  });
-
-  // Loading screen (shows progress)
-  client.on('loading_screen', (percent, message) => {
-    console.log(`[LOADING] ${percent}% - ${message}`);
-  });
-
-  // Remote session saved (pairing code flow)
-  client.on('remote_session_saved', async () => {
-    console.log(`[SESSION] Remote session saved - pairing requested`);
-    await sendWebhook('pairing_requested');
-  });
-
-  return client;
+function findInUi(xml, patterns) {
+  for (const pattern of patterns) {
+    if (xml.includes(pattern)) return pattern;
+  }
+  return null;
 }
 
-// ── Session Data Management ──────────────────────────────────────────────────
-async function saveSessionData() {
-  try {
-    const sessionPath = path.join('.wwebjs_auth', `session-reg_${PHONE_NUMBER}`);
-    const sessionFile = path.join(sessionPath, 'session.json');
-
-    if (fs.existsSync(sessionFile)) {
-      const data = fs.readFileSync(sessionFile, 'utf8');
-      await sendWebhook('session_update', { session_data: data });
-      console.log(`[SESSION] Saved session data (${data.length} bytes)`);
-    }
-  } catch (error) {
-    console.error(`[SESSION] Save error: ${error.message}`);
-  }
+// ── Main Registration Flow ────────────────────────────────────────────────────
+async function launchWhatsApp() {
+  log('INFO', 'Launching WhatsApp...');
+  
+  // Launch WhatsApp
+  execAdb('shell am start -n com.whatsapp/.Main');
+  await sleep(5000);
+  
+  // Check if WhatsApp is running
+  const activity = execAdb('shell dumpsys activity activities | grep mResumedActivity');
+  log('INFO', 'Current activity', { activity });
+  
+  return activity.includes('whatsapp');
 }
 
-// ── Page Interaction Helpers ─────────────────────────────────────────────────
-async function detectWhatsAppPrompts(page) {
-  const prompts = {
-    // Phone number input screen
-    phoneInput: {
-      selector: 'input[type="tel"], input[name="phone"], [data-testid="phone-number-input"]',
-      check: async () => {
-        return await page.evaluate((sel) => {
-          const el = document.querySelector(sel);
-          return el && el.offsetParent !== null;
-        }, 'input[type="tel"], input[name="phone"], [placeholder*="phone" i]');
-      }
-    },
-
-    // OTP/Code input screen
-    otpInput: {
-      selector: 'input[type="text"][maxlength="6"], input[autocomplete="one-time-code"], [data-testid="otp-input"]',
-      check: async () => {
-        return await page.evaluate(() => {
-          // Look for 6-digit input or "code" text
-          const inputs = document.querySelectorAll('input[type="text"]');
-          for (const input of inputs) {
-            if (input.maxLength === 6 || input.placeholder.toLowerCase().includes('code')) {
-              return true;
-            }
-          }
-          // Check for "Enter code" text
-          const bodyText = document.body.innerText.toLowerCase();
-          return bodyText.includes('enter code') || bodyText.includes('verification code') || bodyText.includes('6-digit');
-        });
-      }
-    },
-
-    // Rate limit / Too many attempts
-    rateLimit: {
-      selector: null,
-      check: async () => {
-        return await page.evaluate(() => {
-          const text = document.body.innerText.toLowerCase();
-          return text.includes('too many attempts') || 
-                 text.includes('try again') || 
-                 text.includes('wait') ||
-                 text.includes('rate limited') ||
-                 text.includes('temporarily banned') ||
-                 /\d+\s*(minutes?|hours?|seconds?)/.test(text);
-        });
-      }
-    },
-
-    // Already registered / Active session exists
-    alreadyRegistered: {
-      selector: null,
-      check: async () => {
-        return await page.evaluate(() => {
-          const text = document.body.innerText.toLowerCase();
-          return text.includes('already registered') || 
-                 text.includes('active on another device') ||
-                 text.includes('phone number already in use') ||
-                 text.includes('already linked');
-        });
-      }
-    },
-
-    // Banned / Suspended account
-    banned: {
-      selector: null,
-      check: async () => {
-        return await page.evaluate(() => {
-          const text = document.body.innerText.toLowerCase();
-          return text.includes('banned') || 
-                 text.includes('suspended') ||
-                 text.includes('blocked') ||
-                 text.includes('violated') ||
-                 text.includes('terms of service') ||
-                 text.includes('account disabled');
-        });
-      }
-    },
-
-    // Pairing code screen (8-digit code)
-    pairingCode: {
-      selector: null,
-      check: async () => {
-        return await page.evaluate(() => {
-          const text = document.body.innerText.toLowerCase();
-          return text.includes('linking') || 
-                 text.includes('pairing') ||
-                 text.includes('link device') ||
-                 text.includes('8-digit') ||
-                 text.includes('enter this code');
-        });
-      }
-    },
-
-    // Registration successful / Main chat screen
-    registered: {
-      selector: '[data-testid="chat-list"], [data-testid="menu"], .app-wrapper-web',
-      check: async () => {
-        return await page.evaluate(() => {
-          // Check for main WhatsApp Web interface elements
-          return !!document.querySelector('[data-testid="chat-list"]') ||
-                 !!document.querySelector('[data-testid="search-input"]') ||
-                 !!document.querySelector('[data-icon="menu"]') ||
-                 document.body.innerText.includes('Chats') ||
-                 document.body.innerText.includes('Conversations');
-        });
-      }
-    },
-
-    // Error / Invalid phone
-    invalidPhone: {
-      selector: null,
-      check: async () => {
-        return await page.evaluate(() => {
-          const text = document.body.innerText.toLowerCase();
-          return text.includes('invalid phone') || 
-                 text.includes('invalid number') ||
-                 text.includes('phone number format') ||
-                 text.includes('check your phone number') ||
-                 text.includes('not a valid');
-        });
-      }
-    },
-
-    // SMS vs Call option selection
-    smsOrCall: {
-      selector: null,
-      check: async () => {
-        return await page.evaluate(() => {
-          const text = document.body.innerText.toLowerCase();
-          return text.includes('send sms') || 
-                 text.includes('call me') ||
-                 text.includes("didn't receive") ||
-                 text.includes('resend');
-        });
-      }
-    },
-
-    // Captcha / Verification challenge
-    captcha: {
-      selector: null,
-      check: async () => {
-        return await page.evaluate(() => {
-          const text = document.body.innerText.toLowerCase();
-          return text.includes('captcha') || 
-                 text.includes('verify you are human') ||
-                 text.includes('security check') ||
-                 text.includes("i'm not a robot") ||
-                 !!document.querySelector('iframe[src*="recaptcha"]');
-        });
-      }
-    }
-  };
-
-  const detected = {};
-  for (const [name, prompt] of Object.entries(prompts)) {
-    try {
-      detected[name] = await prompt.check();
-    } catch (e) {
-      detected[name] = false;
-    }
-  }
-
-  return detected;
-}
-
-// ── Main Registration Flow ───────────────────────────────────────────────────
-async function runRegistration() {
-  console.log('='.repeat(60));
-  console.log('WhatsApp Registration Automation');
-  console.log(`Phone: ${PHONE_NUMBER}`);
-  console.log(`User: ${TELEGRAM_USER_ID}`);
-  console.log(`Run ID: ${GITHUB_RUN_ID}`);
-  console.log('='.repeat(60));
-
-  // Validate inputs
-  if (!PHONE_NUMBER || !TELEGRAM_USER_ID || !WEBHOOK_URL) {
-    console.error('[ERROR] Missing required environment variables');
-    process.exit(1);
-  }
-
-  try {
-    // Create client
-    await createWhatsAppClient();
-
-    // Initialize client (this starts the browser)
-    console.log('[INIT] Initializing WhatsApp client...');
-    await client.initialize();
-
-    // Get the underlying page for direct manipulation
-    const page = await client.pupPage;
-
-    if (!page) {
-      throw new Error('Failed to get Puppeteer page');
-    }
-
-    // Wait for WhatsApp Web to load
-    console.log('[WAIT] Waiting for WhatsApp Web to load...');
-    await sleep(5000);
-
-    // ── Registration Flow ─────────────────────────────────────────────────────
-
-    // Step 1: Detect initial state
-    console.log('[DETECT] Checking initial state...');
-    let state = await detectWhatsAppPrompts(page);
-    console.log('[DETECT] Initial state:', JSON.stringify(state, null, 2));
-
-    // Handle various initial states
-    if (state.alreadyRegistered) {
-      console.log('[STATUS] Number already registered');
-      await sendWebhook('already_registered');
-      return;
-    }
-
-    if (state.banned) {
-      console.log('[STATUS] Account banned');
-      const reason = await page.evaluate(() => document.body.innerText);
-      await sendWebhook('banned', { reason: reason.substring(0, 500) });
-      return;
-    }
-
-    if (state.invalidPhone) {
-      console.log('[STATUS] Invalid phone number format');
-      await sendWebhook('bad_number', { reason: 'Invalid phone number format' });
-      return;
-    }
-
-    // Step 2: Enter phone number if prompted
-    if (state.phoneInput) {
-      console.log('[INPUT] Entering phone number...');
-
-      // Format phone number (remove + if present)
-      const cleanPhone = PHONE_NUMBER.replace(/^\+/, '');
-
-      // Find and fill phone input
-      await page.evaluate((phone) => {
-        const inputs = document.querySelectorAll('input[type="tel"], input[type="text"]');
-        for (const input of inputs) {
-          if (input.offsetParent !== null) {
-            input.value = phone;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
-          }
-        }
-        return false;
-      }, cleanPhone);
-
-      // Click next/submit button
-      await page.evaluate(() => {
-        const buttons = document.querySelectorAll('button, [role="button"]');
-        for (const btn of buttons) {
-          const text = btn.innerText.toLowerCase();
-          if (text.includes('next') || text.includes('continue') || text.includes('submit')) {
-            btn.click();
-            return true;
-          }
-        }
-        return false;
-      });
-
-      await sleep(3000);
-      registrationState = 'PHONE_SUBMITTED';
-    }
-
-    // Step 3: Wait for and handle OTP prompt
-    console.log('[OTP] Waiting for OTP screen...');
-    let otpWaitTime = 0;
-    const maxOtpWait = 60000; // 60 seconds for OTP screen to appear
-
-    while (otpWaitTime < maxOtpWait) {
-      state = await detectWhatsAppPrompts(page);
-
-      if (state.otpInput) {
-        console.log('[OTP] OTP input screen detected');
-        break;
-      }
-
-      if (state.rateLimit) {
-        console.log('[RATE_LIMIT] Rate limit detected');
-        // Extract wait time from page text
-        const pageText = await page.evaluate(() => document.body.innerText);
-        const match = pageText.match(/(\d+)\s*(minutes?|hours?|seconds?)/i);
-        const waitSeconds = match ? parseInt(match[1]) * (match[2].startsWith('hour') ? 3600 : match[2].startsWith('minute') ? 60 : 1) : 600;
-
-        await sendWebhook('rate_limited', { wait_seconds: waitSeconds });
-        return;
-      }
-
-      if (state.banned) {
-        console.log('[BANNED] Account banned during registration');
-        await sendWebhook('banned');
-        return;
-      }
-
-      if (state.alreadyRegistered) {
-        console.log('[ALREADY] Already registered detected');
-        await sendWebhook('already_registered');
-        return;
-      }
-
+async function handleWelcomeScreen() {
+  log('INFO', 'Checking for welcome screen...');
+  const xml = await dumpUi();
+  
+  // Common welcome screen indicators
+  const welcomeIndicators = [
+    'Agree and continue',
+    'Terms and Privacy Policy',
+    'Welcome to WhatsApp',
+    'Tap Agree and Continue'
+  ];
+  
+  if (findInUi(xml, welcomeIndicators)) {
+    log('INFO', 'Welcome screen detected, tapping Agree...');
+    
+    // Try to find and tap "Agree and continue" button
+    // Coordinates for Pixel 4 (1080x2280)
+    tap(540, 1800); // Approximate location of Agree button
+    await sleep(2000);
+    
+    // Check for second confirmation
+    await sleep(1000);
+    const xml2 = await dumpUi();
+    if (findInUi(xml2, ['CONTINUE', 'Continue', 'OK', 'Agree'])) {
+      tap(540, 1800);
       await sleep(2000);
-      otpWaitTime += 2000;
     }
+    
+    return true;
+  }
+  
+  return false;
+}
 
-    // Step 4: Request OTP from user via webhook
-    if (state.otpInput) {
-      registrationState = 'OTP_REQUESTED';
-      console.log('[OTP] Requesting OTP from user via Telegram...');
-      await sendWebhook('otp_requested');
+async function enterPhoneNumber() {
+  log('INFO', 'Entering phone number...', { phone: PHONE_NUMBER });
+  
+  const xml = await dumpUi();
+  
+  // Check if we're on phone number entry screen
+  const phoneIndicators = [
+    'phone number',
+    'Phone number',
+    'Enter your phone number',
+    'Verify your phone number'
+  ];
+  
+  if (!findInUi(xml, phoneIndicators)) {
+    log('WARN', 'Phone number screen not detected, current UI:', { xml: xml.substring(0, 500) });
+    // Try to navigate to it if we're stuck
+    pressBack();
+    await sleep(1000);
+  }
+  
+  // Clear any existing text
+  tap(700, 800); // Tap number field
+  await sleep(500);
+  
+  // Select all and delete
+  execAdb('shell input keyevent --longpress 29 29 29'); // Ctrl+A equivalent
+  await sleep(200);
+  execAdb('shell input keyevent 67'); // Delete
+  await sleep(200);
+  
+  // Enter phone number
+  inputText(PHONE_NUMBER);
+  await sleep(1000);
+  
+  // Tap Next/Done
+  tap(540, 1300); // Next button location
+  await sleep(3000);
+  
+  // Check for confirmation dialog
+  const xml2 = await dumpUi();
+  if (findInUi(xml2, ['OK', 'YES', 'Yes', 'number is correct'])) {
+    tap(700, 1400); // Tap OK/Yes
+    await sleep(2000);
+  }
+  
+  return true;
+}
 
-      // Poll for OTP from bot
-      console.log('[OTP] Polling for OTP...');
-      const otp = await pollForOtp();
+async function detectPromptType() {
+  const xml = await dumpUi();
+  
+  // OTP/SMS verification screen
+  if (findInUi(xml, ['Enter 6-digit code', 'waiting to automatically detect', 'SMS', 'verification code'])) {
+    return 'OTP_REQUESTED';
+  }
+  
+  // Already registered / Active on another device
+  if (findInUi(xml, ['Active on another device', 'already registered', 'registered on another phone'])) {
+    return 'ALREADY_REGISTERED';
+  }
+  
+  // Rate limited
+  if (findInUi(xml, ['try again later', 'too many attempts', 'temporarily banned', 'wait', 'minutes', 'hours'])) {
+    const match = xml.match(/(\d+)\s*(minute|hour|second)/i);
+    const waitSeconds = match ? 
+      (match[2] === 'hour' ? parseInt(match[1]) * 3600 : 
+       match[2] === 'minute' ? parseInt(match[1]) * 60 : parseInt(match[1])) : 600;
+    return { type: 'RATE_LIMITED', waitSeconds };
+  }
+  
+  // Invalid number
+  if (findInUi(xml, ['invalid phone number', 'not a valid', 'check the number', 'incorrect number'])) {
+    return 'BAD_NUMBER';
+  }
+  
+  // Network error
+  if (findInUi(xml, ['network error', 'no internet', 'connection', 'check your connection'])) {
+    return 'NETWORK_ERROR';
+  }
+  
+  // Ban/Restriction
+  if (findInUi(xml, ['banned', 'restricted', 'violated', 'terms of service', 'suspended'])) {
+    return 'BANNED';
+  }
+  
+  // Call me option (alternative to SMS)
+  if (findInUi(xml, ['Call me', 'call me', 'phone call'])) {
+    return 'CALL_ME_OPTION';
+  }
+  
+  // Loading/Processing
+  if (findInUi(xml, ['Connecting', 'loading', 'please wait', 'Processing', '...'])) {
+    return 'LOADING';
+  }
+  
+  // Profile setup (success indicator)
+  if (findInUi(xml, ['Your name', 'profile photo', 'About you', 'Display name'])) {
+    return 'PROFILE_SETUP';
+  }
+  
+  // Main chats screen (already logged in)
+  if (findInUi(xml, ['Chats', 'calls', 'camera', 'status'])) {
+    return 'LOGGED_IN';
+  }
+  
+  return 'UNKNOWN';
+}
 
-      // Enter OTP
-      console.log(`[OTP] Entering OTP: ${otp.replace(/\d(?=\d{2})/g, '*')}`);
-      await page.evaluate((code) => {
-        const inputs = document.querySelectorAll('input[type="text"]');
-        for (const input of inputs) {
-          if (input.maxLength === 6 || input.offsetParent !== null) {
-            input.value = code;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-
-            // Trigger submit
-            const event = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter' });
-            input.dispatchEvent(event);
-            return true;
-          }
-        }
-        return false;
-      }, otp);
-
-      await sleep(3000);
-      registrationState = 'OTP_SUBMITTED';
-
-      // Wait for result
-      console.log('[WAIT] Waiting for OTP validation...');
-      await sleep(5000);
-
-      // Check result
-      state = await detectWhatsAppPrompts(page);
-
-      if (state.registered) {
-        console.log('[SUCCESS] Registration successful!');
-        await sendWebhook('registered');
-        return;
+async function handleOtpFlow() {
+  log('INFO', 'OTP verification flow started');
+  
+  // Notify bot that OTP is requested
+  await sendWebhook('otp_requested');
+  
+  // Wait for OTP from user (via Telegram bot)
+  const startTime = Date.now();
+  let otp = null;
+  
+  while (Date.now() - startTime < MAX_WAIT_TIME) {
+    otp = await pollForOtp();
+    
+    if (otp) {
+      log('INFO', 'OTP received', { otp: otp.replace(/\d/g, '*') });
+      break;
+    }
+    
+    // Check for "Call me" option availability (after ~60 seconds)
+    const elapsed = Date.now() - startTime;
+    if (elapsed > 60000 && elapsed < 65000) {
+      const xml = await dumpUi();
+      if (findInUi(xml, ['Call me', 'call me'])) {
+        log('INFO', 'Call me option is available');
+        // We could tap it here if needed, but we'll wait for SMS OTP
       }
+    }
+    
+    process.stdout.write('.');
+    await sleep(POLL_INTERVAL);
+  }
+  
+  if (!otp) {
+    throw new Error('OTP_TIMEOUT');
+  }
+  
+  // Enter OTP
+  log('INFO', 'Entering OTP...');
+  
+  // Tap on OTP field and enter
+  tap(540, 900); // OTP field
+  await sleep(500);
+  
+  inputText(otp);
+  await sleep(2000);
+  
+  // Wait for verification
+  await sleep(5000);
+  
+  // Check result
+  const prompt = await detectPromptType();
+  
+  if (prompt === 'PROFILE_SETUP' || prompt === 'LOGGED_IN') {
+    await sendWebhook('registered');
+    return true;
+  } else if (prompt === 'OTP_REQUESTED') {
+    // OTP was wrong
+    await sendWebhook('otp_error');
+    return false;
+  }
+  
+  return false;
+}
 
-      if (state.otpInput || state.invalidPhone) {
-        // OTP was wrong
-        console.log('[ERROR] OTP validation failed');
-        await sendWebhook('otp_error');
+async function handleProfileSetup() {
+  log('INFO', 'Setting up profile...');
+  
+  const xml = await dumpUi();
+  
+  // Skip name entry if present (use default)
+  if (findInUi(xml, ['Your name', 'Display name'])) {
+    tap(540, 1300); // Next/Continue
+    await sleep(2000);
+  }
+  
+  // Skip photo if requested
+  if (findInUi(xml, ['Add photo', 'profile photo', 'skip'])) {
+    // Look for skip button
+    tap(900, 400); // Skip button (top right)
+    await sleep(2000);
+  }
+  
+  await sendWebhook('registered');
+  return true;
+}
+
+async function checkForPinEntry() {
+  const xml = await dumpUi();
+  
+  if (findInUi(xml, ['PIN', 'Two-step verification', 'Enter PIN', 'passcode'])) {
+    log('WARN', 'Two-step verification PIN required - cannot proceed');
+    await sendWebhook('bad_number', { reason: 'Two-step verification PIN required' });
+    return true; // Indicates we should stop
+  }
+  
+  return false;
+}
+
+async function handleRegistrationFlow() {
+  log('INFO', '=== Starting WhatsApp Registration Flow ===');
+  log('INFO', 'Configuration', { 
+    phone: PHONE_NUMBER, 
+    userId: TELEGRAM_USER_ID,
+    webhookUrl: WEBHOOK_URL 
+  });
+  
+  // Wait for emulator to be fully ready
+  await sleep(5000);
+  
+  // Check ADB connection
+  try {
+    const devices = execAdb('devices');
+    log('INFO', 'ADB devices', { devices });
+    if (!devices.includes('emulator')) {
+      throw new Error('No emulator found');
+    }
+  } catch (e) {
+    throw new Error(`ADB connection failed: ${e.message}`);
+  }
+  
+  // Launch WhatsApp
+  await launchWhatsApp();
+  await sleep(3000);
+  
+  // Handle initial screens
+  await handleWelcomeScreen();
+  await sleep(2000);
+  
+  // Enter phone number
+  await enterPhoneNumber();
+  await sleep(5000);
+  
+  // Main state machine
+  let attempts = 0;
+  const maxAttempts = 50;
+  
+  while (attempts < maxAttempts) {
+    attempts++;
+    log('INFO', `Checking state (attempt ${attempts})...`);
+    
+    const prompt = await detectPromptType();
+    log('INFO', 'Detected prompt', { prompt: typeof prompt === 'object' ? prompt.type : prompt });
+    
+    if (prompt === 'OTP_REQUESTED') {
+      const success = await handleOtpFlow();
+      if (success) {
+        await handleProfileSetup();
+        log('INFO', '=== Registration Complete ===');
         return;
-      }
-    }
-
-    // Step 5: Handle pairing code flow (if applicable)
-    if (state.pairingCode) {
-      console.log('[PAIRING] Pairing code screen detected');
-      await sendWebhook('pairing_requested');
-
-      // Wait for pairing code from user
-      // This would be handled via the /pair endpoint
-      // For now, we wait for a longer period
-      console.log('[PAIRING] Waiting for pairing code...');
-      await sleep(30000);
-    }
-
-    // Final state check
-    state = await detectWhatsAppPrompts(page);
-
-    if (state.registered) {
-      console.log('[SUCCESS] Final check: Registration confirmed');
-      await sendWebhook('registered');
-    } else if (state.banned) {
-      console.log('[BANNED] Final check: Account banned');
-      await sendWebhook('banned');
-    } else {
-      console.log('[UNKNOWN] Final state unclear, checking page content...');
-      const pageContent = await page.evaluate(() => document.body.innerText);
-      console.log('[CONTENT]', pageContent.substring(0, 1000));
-
-      // Try to determine from content
-      if (pageContent.includes('Chats') || pageContent.includes('Conversations')) {
-        await sendWebhook('registered');
       } else {
-        await sendWebhook('bad_number', { reason: 'Unknown final state', content: pageContent.substring(0, 500) });
+        // OTP was wrong, might get another chance or fail
+        await sleep(3000);
       }
+    } else if (prompt === 'ALREADY_REGISTERED') {
+      await sendWebhook('already_registered');
+      log('INFO', 'Number already registered on another device');
+      return;
+    } else if (prompt === 'BAD_NUMBER') {
+      await sendWebhook('bad_number', { reason: 'Invalid phone number format' });
+      throw new Error('BAD_NUMBER');
+    } else if (prompt === 'BANNED') {
+      await sendWebhook('banned');
+      throw new Error('NUMBER_BANNED');
+    } else if (typeof prompt === 'object' && prompt.type === 'RATE_LIMITED') {
+      await sendWebhook('rate_limited', { wait_seconds: prompt.waitSeconds });
+      throw new Error(`RATE_LIMITED: ${prompt.waitSeconds}s`);
+    } else if (prompt === 'NETWORK_ERROR') {
+      log('WARN', 'Network error detected, waiting...');
+      await sleep(10000);
+    } else if (prompt === 'PROFILE_SETUP') {
+      await handleProfileSetup();
+      return;
+    } else if (prompt === 'LOGGED_IN') {
+      await sendWebhook('registered');
+      return;
+    } else if (prompt === 'LOADING') {
+      log('INFO', 'Loading...');
+      await sleep(3000);
+    } else if (prompt === 'CALL_ME_OPTION') {
+      log('INFO', 'Call me option available, continuing to wait for SMS');
+      await sleep(5000);
+    } else if (prompt === 'UNKNOWN') {
+      // Check for PIN entry
+      if (await checkForPinEntry()) {
+        return;
+      }
+      
+      // Try to recover from unknown state
+      log('WARN', 'Unknown state, attempting recovery...');
+      await takeScreenshot(null, 'unknown_state');
+      pressBack();
+      await sleep(2000);
     }
-
-  } catch (error) {
-    console.error(`[FATAL] Registration failed: ${error.message}`);
-    console.error(error.stack);
-
-    // Send failure notification
-    await sendWebhook('bad_number', { 
-      reason: error.message,
-      stack: error.stack 
-    });
-
-    process.exit(1);
-  } finally {
-    // Cleanup
-    if (client) {
-      console.log('[CLEANUP] Destroying client...');
-      try {
-        await client.destroy();
-      } catch (e) {
-        // Ignore cleanup errors
-      }
+    
+    // Safety check - if we've been waiting too long
+    if (attempts === maxAttempts) {
+      throw new Error('MAX_ATTEMPTS_EXCEEDED');
     }
   }
 }
 
-// ── Execute ───────────────────────────────────────────────────────────────────
-runRegistration().then(() => {
-  console.log('[DONE] Registration script completed');
-  process.exit(0);
-}).catch((error) => {
-  console.error('[FATAL] Unhandled error:', error);
-  process.exit(1);
-});
+// ── Error Handling ─────────────────────────────────────────────────────────────
+async function handleError(error) {
+  log('ERROR', 'Registration failed', { 
+    error: error.message, 
+    stack: error.stack 
+  });
+  
+  // Determine error type
+  let event = 'bad_number';
+  let reason = error.message;
+  
+  if (error.message.includes('OTP_TIMEOUT')) {
+    event = 'bad_number';
+    reason = 'OTP entry timeout - no code received within 15 minutes';
+  } else if (error.message.includes('RATE_LIMITED')) {
+    event = 'rate_limited';
+    const match = error.message.match(/(\d+)/);
+    if (match) {
+      await sendWebhook(event, { wait_seconds: parseInt(match[1]) });
+      return;
+    }
+  } else if (error.message.includes('BANNED')) {
+    event = 'banned';
+  }
+  
+  await sendWebhook(event, { reason });
+}
+
+// ── Main Entry ─────────────────────────────────────────────────────────────────
+(async () => {
+  try {
+    await handleRegistrationFlow();
+    process.exit(0);
+  } catch (error) {
+    await handleError(error);
+    process.exit(1);
+  }
+})();
