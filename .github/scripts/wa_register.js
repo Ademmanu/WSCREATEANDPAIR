@@ -407,7 +407,7 @@ async function detectWhatsAppPrompts(page) {
           const text = document.body.innerText.toLowerCase();
           return text.includes('send sms') || 
                  text.includes('call me') ||
-                 text.includes('didn't receive') ||
+                 text.includes("didn't receive") ||
                  text.includes('resend');
         });
       }
@@ -422,7 +422,7 @@ async function detectWhatsAppPrompts(page) {
           return text.includes('captcha') || 
                  text.includes('verify you are human') ||
                  text.includes('security check') ||
-                 text.includes('i'm not a robot') ||
+                 text.includes("i'm not a robot") ||
                  !!document.querySelector('iframe[src*="recaptcha"]');
         });
       }
