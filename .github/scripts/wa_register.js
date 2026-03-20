@@ -704,24 +704,8 @@ async function main() {
     }
   }
 
-  // Language screen arrow (newer WhatsApp versions)
-  await showProgress(8, 10, 'Language selection');
-  const langXml2 = await dumpUI(4000);
-  if (langXml2.includes('Choose your language') || langXml2.includes('Welcome to WhatsApp')) {
-    await showOnScreen('Language screen detected', 'INFO');
-    log('MAIN', 'Language screen — tapping arrow');
-    const arrowTapped =
-      await tapElement('next', langXml2, 'Next arrow') ||
-      await tapElement('Next', langXml2, 'Next button') ||
-      await tapElement('Continue', langXml2, 'Continue button');
-    if (!arrowTapped) {
-      await tap(108, 2100, 'Arrow position fallback');
-    }
-    await sleep(3000);
-  }
-
   // ── Accept Terms ──────────────────────────────────────────────────────────
-  await showProgress(9, 10, 'Accepting terms');
+  await showProgress(8, 10, 'Accepting terms');
   await showOnScreen('Looking for terms agreement...', 'INFO');
   
   const agreeResult = await waitForAny([
@@ -742,13 +726,174 @@ async function main() {
     await logScreen('POST-AGREE');
   }
 
-  // ── Final status ──────────────────────────────────────────────────────────
-  await showProgress(10, 10, 'Setup complete');
-  await logScreen('AFTER-AGREE-DONE');
-  await showOnScreen('Initial setup complete!', 'SUCCESS', 5000);
-  await showOnScreen('Ready for registration flow', 'INFO', 3000);
+  // ── Handle Notification Permission ───────────────────────────────────────
+  await showProgress(9, 10, 'Handling permissions');
+  await sleep(2000);
+  const notifXml = await dumpUI(4000);
   
-  log('MAIN', 'Setup complete — ready for next steps');
+  if (notifXml.includes('Allow WhatsApp to send you notifications') || 
+      notifXml.includes('send you notifications')) {
+    await showOnScreen('Notification permission dialog', 'INFO');
+    log('MAIN', 'Notification permission — tapping Allow');
+    const allowTapped = 
+      await tapElement('Allow', notifXml, 'Allow notifications') ||
+      await tapElement('ALLOW', notifXml, 'ALLOW notifications');
+    if (!allowTapped) {
+      await tap(650, 1400, 'Allow button fallback');
+    }
+    await sleep(3000);
+  }
+
+  // ── Enter Phone Number ───────────────────────────────────────────────────
+  await showProgress(10, 15, 'Entering phone number');
+  await showOnScreen('Waiting for phone number screen...', 'INFO');
+  
+  // Wait for phone number entry screen
+  const phoneScreenResult = await waitForAny([
+    'Enter your phone number',
+    'Phone number',
+    'country code',
+    'Your phone number',
+  ], 30000);
+
+  if (!phoneScreenResult.matched) {
+    await showOnScreen('Phone screen not found - taking screenshot', 'WARNING', 3000);
+    await logScreen('PHONE-SCREEN-NOT-FOUND');
+  }
+
+  await sleep(2000);
+  await logScreen('PHONE-ENTRY');
+
+  // The phone number screen usually has:
+  // 1. Country code selector dropdown
+  // 2. Phone number input field
+  
+  await showOnScreen(`Entering phone: +${phoneInfo.countryCode} ${phoneInfo.nationalNumber}`, 'ACTION', 2000);
+  log('MAIN', `Entering phone: +${phoneInfo.countryCode} ${phoneInfo.nationalNumber}`);
+
+  // Method 1: Try to tap directly on the phone number input field
+  await sleep(1000);
+  const phoneXml = await dumpUI();
+  
+  // Look for the input field - usually has resource-id with "registration_phone"
+  // or is the main EditText on the screen
+  const inputFieldMatch = phoneXml.match(/resource-id="[^"]*phone[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i);
+  
+  if (inputFieldMatch) {
+    const x = Math.floor((parseInt(inputFieldMatch[1]) + parseInt(inputFieldMatch[3])) / 2);
+    const y = Math.floor((parseInt(inputFieldMatch[2]) + parseInt(inputFieldMatch[4])) / 2);
+    await tap(x, y, 'Phone number input field');
+  } else {
+    // Fallback: tap common phone input position
+    await tap(540, 900, 'Phone input field (fallback position)');
+  }
+
+  await sleep(1000);
+
+  // Clear any existing text first
+  for (let i = 0; i < 15; i++) {
+    await keyevent('KEYCODE_DEL', '');
+  }
+  await sleep(500);
+
+  // Type the national number (without country code, as it should be pre-selected)
+  await typeText(phoneInfo.nationalNumber, `National number: ${phoneInfo.nationalNumber}`);
+  await sleep(2000);
+
+  await logScreen('AFTER-PHONE-ENTRY');
+
+  // ── Tap NEXT to Submit ────────────────────────────────────────────────────
+  await showProgress(11, 15, 'Submitting phone number');
+  await showOnScreen('Submitting phone number...', 'ACTION');
+  
+  await sleep(1000);
+  const nextXml = await dumpUI();
+  
+  const nextTapped = 
+    await tapElement('NEXT', nextXml, 'NEXT button') ||
+    await tapElement('Next', nextXml, 'Next button') ||
+    await tapElement('Continue', nextXml, 'Continue button');
+  
+  if (!nextTapped) {
+    // Fallback: NEXT button is usually at bottom right
+    await tap(900, 2000, 'NEXT button (fallback position)');
+  }
+
+  await sleep(3000);
+
+  // ── Handle Confirmation Dialog ───────────────────────────────────────────
+  await showOnScreen('Checking for confirmation dialog...', 'INFO');
+  await sleep(2000);
+  
+  const confirmXml = await dumpUI();
+  if (confirmXml.includes('Is this OK') || confirmXml.includes('correct') || 
+      confirmXml.includes(phoneInfo.nationalNumber)) {
+    await showOnScreen('Confirmation dialog detected', 'INFO');
+    log('MAIN', 'Confirmation dialog — tapping OK');
+    const okTapped =
+      await tapElement('OK', confirmXml, 'Confirm phone number') ||
+      await tapElement('Yes', confirmXml, 'Yes button') ||
+      await tapElement('Confirm', confirmXml, 'Confirm button');
+    if (!okTapped) {
+      await tap(650, 1400, 'OK button fallback');
+    }
+    await sleep(3000);
+  }
+
+  // ── Wait for OTP Request ──────────────────────────────────────────────────
+  await showProgress(12, 15, 'Requesting OTP');
+  await showOnScreen('Waiting for OTP request...', 'INFO', 3000);
+  
+  // Wait for either "Verifying" or "Enter code" screen
+  const otpScreenResult = await waitForAny([
+    'Verifying',
+    'Enter the 6-digit code',
+    'Enter code',
+    'We sent',
+    'digit code',
+  ], 60000);
+
+  if (otpScreenResult.matched) {
+    await showOnScreen(`OTP screen detected: ${otpScreenResult.matched}`, 'SUCCESS', 2000);
+    log('MAIN', `OTP screen found: "${otpScreenResult.matched}"`);
+  } else {
+    await showOnScreen('OTP screen not detected - checking current state', 'WARNING', 3000);
+    await logScreen('OTP-SCREEN-CHECK');
+  }
+
+  // ── Notify webhook about OTP request ──────────────────────────────────────
+  await showProgress(13, 15, 'Requesting OTP via webhook');
+  await showOnScreen('Requesting OTP from bot...', 'INFO', 2000);
+  log('MAIN', 'Sending otp_requested webhook...');
+  
+  await webhook('otp_requested', {
+    phone_number: PHONE,
+    country: phoneInfo.country,
+  });
+
+  // ── Wait for OTP from webhook ─────────────────────────────────────────────
+  await showOnScreen('Waiting for OTP from Telegram...', 'INFO', 3000);
+  log('MAIN', 'Waiting for OTP from user via Telegram...');
+  
+  // Poll for OTP (simplified - in real implementation, you'd poll an endpoint)
+  // For now, we just wait and show status
+  await showOnScreen('Check Telegram for OTP code', 'WARNING', 5000);
+  
+  // This is where you would implement actual OTP retrieval logic
+  // For example, polling a webhook endpoint or waiting for user input
+  
+  await showProgress(14, 15, 'Waiting for OTP');
+  await showOnScreen('Registration paused - awaiting OTP', 'INFO', 5000);
+  
+  log('MAIN', 'Registration paused - script would normally wait for OTP here');
+  log('MAIN', 'In production, implement OTP polling or webhook callback');
+
+  // ── Completion ────────────────────────────────────────────────────────────
+  await showProgress(15, 15, 'Process complete');
+  await showOnScreen('Registration initiated successfully!', 'SUCCESS', 5000);
+  await showOnScreen('Awaiting OTP entry (manual or automated)', 'INFO', 5000);
+  
+  log('MAIN', 'Phone number submitted - awaiting OTP');
   
   // Clear notifications after delay
   await sleep(5000);
