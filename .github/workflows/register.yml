@@ -1,1 +1,152 @@
+name: WhatsApp Registration
 
+on:
+  workflow_dispatch:
+    inputs:
+      phone_number:
+        description: 'Phone number to register'
+        required: true
+        type: string
+      telegram_user_id:
+        description: 'Telegram user ID for callbacks'
+        required: true
+        type: string
+      webhook_url:
+        description: 'Bot webhook base URL'
+        required: true
+        type: string
+      webhook_secret:
+        description: 'Shared secret for webhook auth'
+        required: true
+        type: string
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - name: Install ADB + emulator tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            adb android-tools-adb curl jq wget unzip
+
+      - name: Install Node dependencies
+        env:
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
+        run: npm install --omit=dev
+
+      - name: Download WhatsApp APK from GitHub Release
+        run: |
+          echo "[APK] Downloading WhatsApp APK from repo release..."
+          REPO="${{ github.repository }}"
+
+          wget -q             "https://github.com/${REPO}/releases/download/whatsapp/whatsapp.apk"             -O /tmp/whatsapp.apk             --user-agent="Mozilla/5.0"             --timeout=180             || true
+
+          APK_SIZE=$(stat -c%s /tmp/whatsapp.apk 2>/dev/null || echo 0)
+          echo "[APK] Downloaded size: ${APK_SIZE} bytes"
+
+          if [ "$APK_SIZE" -lt 10000000 ]; then
+            echo "[APK] ERROR: APK not found in releases."
+            echo "[APK] Upload whatsapp.apk to: https://github.com/${REPO}/releases/tag/whatsapp"
+            exit 1
+          fi
+
+          echo "[APK] Native lib folders:"
+          unzip -l /tmp/whatsapp.apk 2>/dev/null | grep "lib/" | awk '{print $4}' | cut -d/ -f1-2 | sort -u || true
+          echo "[APK] Ready: ${APK_SIZE} bytes"
+
+      - name: Run registration script
+        id: registration
+        env:
+          PHONE_NUMBER: ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
+          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
+          NODE_PORT: '3001'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          # API 33 google_apis_playstore ships with GPS 22.x+ which satisfies
+          # WhatsApp's minimum GPS requirement. Lower API levels ship GPS 20.x
+          # which WhatsApp hard-blocks since 2023.
+          api-level: 33
+          target: google_apis_playstore
+          arch: x86_64
+          profile: pixel_4
+          avd-name: wa_reg
+          emulator-options: >
+            -no-window
+            -gpu swiftshader
+            -no-snapshot
+            -noaudio
+            -no-boot-anim
+            -memory 4096
+            -cores 2
+          # Disable lock screen at AVD level before boot
+          pre-emulator-launch-script: |
+            echo "hw.mainKeys=no" >> ~/.android/avd/wa_reg.avd/config.ini
+            echo "lockScreen.disabled=true" >> ~/.android/avd/wa_reg.avd/config.ini
+          disable-animations: true
+          emulator-boot-timeout: 600
+          script: node .github/scripts/wa_register.js
+
+      - name: Notify bot — registration failed
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+          PHONE_NUMBER: ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "[FAILURE] Registration failed for $PHONE_NUMBER — notifying bot"
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            -d "{
+              \"event\": \"bad_number\",
+              \"phone_number\": \"$PHONE_NUMBER\",
+              \"telegram_user_id\": $TELEGRAM_USER_ID,
+              \"run_id\": \"$GITHUB_RUN_ID\",
+              \"reason\": \"GitHub Actions workflow failed — emulator or script error\"
+            }"
+
+      - name: Notify bot — registration cancelled
+        if: cancelled()
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+          PHONE_NUMBER: ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "[CANCELLED] Registration cancelled for $PHONE_NUMBER — notifying bot"
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            -d "{
+              \"event\": \"bad_number\",
+              \"phone_number\": \"$PHONE_NUMBER\",
+              \"telegram_user_id\": $TELEGRAM_USER_ID,
+              \"run_id\": \"$GITHUB_RUN_ID\",
+              \"reason\": \"GitHub Actions workflow was cancelled\"
+            }"
