@@ -1,13 +1,17 @@
 # ── Stage 1: Node.js dependencies ────────────────────────────────────────────
 FROM node:20-slim AS node-deps
 
-RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git \
+      openssh-client \
+      ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Rewrite SSH GitHub URLs → HTTPS so npm install works without SSH keys in Docker
-RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+# Rewrite SSH GitHub URLs → HTTPS (libsignal-node uses ssh:// URL)
+RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+ && git config --global http.sslVerify true
 
 COPY package.json ./
 RUN npm install --omit=dev
