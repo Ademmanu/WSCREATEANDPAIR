@@ -1,11 +1,13 @@
 # ── Stage 1: Node.js dependencies ────────────────────────────────────────────
 FROM node:20-slim AS node-deps
 
-# git required — Baileys sub-dependencies install from GitHub URLs
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Rewrite SSH GitHub URLs → HTTPS so npm install works without SSH keys in Docker
+RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 
 COPY package.json ./
 RUN npm install --omit=dev
@@ -13,7 +15,6 @@ RUN npm install --omit=dev
 # ── Stage 2: Final image ──────────────────────────────────────────────────────
 FROM node:20-slim
 
-# Python 3 + pip only — no Chromium/Puppeteer (Baileys is pure Node)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 \
       python3-pip \
