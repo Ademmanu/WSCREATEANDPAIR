@@ -765,38 +765,112 @@ async function main() {
   await logScreen('PHONE-ENTRY');
 
   // The phone number screen usually has:
-  // 1. Country code selector dropdown
+  // 1. Country code selector dropdown (tap to open country list)
   // 2. Phone number input field
   
-  await showOnScreen(`Entering phone: +${phoneInfo.countryCode} ${phoneInfo.nationalNumber}`, 'ACTION', 2000);
-  log('MAIN', `Entering phone: +${phoneInfo.countryCode} ${phoneInfo.nationalNumber}`);
+  await showOnScreen(`Setting country: +${phoneInfo.countryCode}`, 'ACTION', 2000);
+  log('MAIN', `Need to select country code: +${phoneInfo.countryCode}`);
 
-  // Method 1: Try to tap directly on the phone number input field
+  // ── Step 1: Select Country Code ──────────────────────────────────────────
   await sleep(1000);
-  const phoneXml = await dumpUI();
+  let phoneXml = await dumpUI();
   
-  // Look for the input field - usually has resource-id with "registration_phone"
-  // or is the main EditText on the screen
-  const inputFieldMatch = phoneXml.match(/resource-id="[^"]*phone[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i);
+  // Find and tap the country selector - usually contains country name or "Country code"
+  // Look for elements containing "United States", "Country", or the country code dropdown
+  const countryButtonMatch = phoneXml.match(/text="[^"]*Country[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i) ||
+                             phoneXml.match(/content-desc="[^"]*Country[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i) ||
+                             phoneXml.match(/resource-id="[^"]*country[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i);
+  
+  if (countryButtonMatch) {
+    const x = Math.floor((parseInt(countryButtonMatch[1]) + parseInt(countryButtonMatch[3])) / 2);
+    const y = Math.floor((parseInt(countryButtonMatch[2]) + parseInt(countryButtonMatch[4])) / 2);
+    await tap(x, y, 'Country selector button');
+  } else {
+    // Fallback: Country selector is usually in upper portion of screen
+    await tap(540, 700, 'Country selector (fallback position)');
+  }
+
+  await sleep(2000);
+  await logScreen('COUNTRY-SELECTOR-OPENED');
+
+  // ── Step 2: Search for Country ───────────────────────────────────────────
+  await showOnScreen(`Searching for country code +${phoneInfo.countryCode}`, 'ACTION', 2000);
+  
+  // Country list usually has a search box at the top
+  phoneXml = await dumpUI();
+  
+  const searchBoxMatch = phoneXml.match(/resource-id="[^"]*search[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i) ||
+                         phoneXml.match(/class="[^"]*EditText[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
+  
+  if (searchBoxMatch) {
+    const x = Math.floor((parseInt(searchBoxMatch[1]) + parseInt(searchBoxMatch[3])) / 2);
+    const y = Math.floor((parseInt(searchBoxMatch[2]) + parseInt(searchBoxMatch[4])) / 2);
+    await tap(x, y, 'Country search box');
+  } else {
+    // Fallback: Search box usually at top
+    await tap(540, 300, 'Country search box (fallback)');
+  }
+
+  await sleep(1000);
+
+  // Type the country code to search
+  await typeText(phoneInfo.countryCode, `Country code: ${phoneInfo.countryCode}`);
+  await sleep(2000);
+
+  await logScreen('AFTER-COUNTRY-SEARCH');
+
+  // ── Step 3: Select Matching Country ──────────────────────────────────────
+  await showOnScreen(`Selecting country with code +${phoneInfo.countryCode}`, 'ACTION', 2000);
+  
+  phoneXml = await dumpUI();
+  
+  // Look for the matching country in the list - it should contain "+XXX" where XXX is the country code
+  const countryPattern = new RegExp(`text="[^"]*\\+${phoneInfo.countryCode}[^"]*"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`, 'i');
+  const countryMatch = phoneXml.match(countryPattern);
+  
+  if (countryMatch) {
+    const x = Math.floor((parseInt(countryMatch[1]) + parseInt(countryMatch[3])) / 2);
+    const y = Math.floor((parseInt(countryMatch[2]) + parseInt(countryMatch[4])) / 2);
+    await tap(x, y, `Country: +${phoneInfo.countryCode}`);
+    await showOnScreen(`Selected country: +${phoneInfo.countryCode}`, 'SUCCESS', 2000);
+  } else {
+    // Fallback: tap first item in list (usually the matching result)
+    await tap(540, 600, 'First country in search results');
+    await showOnScreen(`Selected first search result`, 'WARNING', 2000);
+  }
+
+  await sleep(2000);
+  await logScreen('AFTER-COUNTRY-SELECTION');
+
+  // ── Step 4: Enter Phone Number ───────────────────────────────────────────
+  await showOnScreen(`Entering number: ${phoneInfo.nationalNumber}`, 'ACTION', 2000);
+  log('MAIN', `Entering national number: ${phoneInfo.nationalNumber}`);
+
+  await sleep(1000);
+  phoneXml = await dumpUI();
+  
+  // Now find the phone number input field
+  const inputFieldMatch = phoneXml.match(/resource-id="[^"]*phone[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/i) ||
+                          phoneXml.match(/class="[^"]*EditText[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
   
   if (inputFieldMatch) {
     const x = Math.floor((parseInt(inputFieldMatch[1]) + parseInt(inputFieldMatch[3])) / 2);
     const y = Math.floor((parseInt(inputFieldMatch[2]) + parseInt(inputFieldMatch[4])) / 2);
     await tap(x, y, 'Phone number input field');
   } else {
-    // Fallback: tap common phone input position
-    await tap(540, 900, 'Phone input field (fallback position)');
+    // Fallback: Phone input is usually in middle-lower portion
+    await tap(540, 1200, 'Phone input field (fallback position)');
   }
 
   await sleep(1000);
 
   // Clear any existing text first
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < 20; i++) {
     await keyevent('KEYCODE_DEL', '');
   }
   await sleep(500);
 
-  // Type the national number (without country code, as it should be pre-selected)
+  // Type the national number (without country code)
   await typeText(phoneInfo.nationalNumber, `National number: ${phoneInfo.nationalNumber}`);
   await sleep(2000);
 
