@@ -4,147 +4,60 @@ on:
   workflow_dispatch:
     inputs:
       phone_number:
-        description: 'Phone number to register'
+        description: 'Phone number'
         required: true
         type: string
       telegram_user_id:
-        description: 'Telegram user ID for callbacks'
+        description: 'Telegram user ID'
         required: true
         type: string
       webhook_url:
-        description: 'Bot webhook base URL'
+        description: 'Webhook URL'
         required: true
         type: string
       webhook_secret:
-        description: 'Shared secret for webhook auth'
+        description: 'Webhook secret'
         required: true
         type: string
 
 jobs:
   register:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install Chrome dependencies
+      - name: Enable KVM
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            ca-certificates \
-            fonts-liberation \
-            libappindicator3-1 \
-            libasound2 \
-            libatk-bridge2.0-0 \
-            libatk1.0-0 \
-            libc6 \
-            libcairo2 \
-            libcups2 \
-            libdbus-1-3 \
-            libexpat1 \
-            libfontconfig1 \
-            libgbm1 \
-            libgcc1 \
-            libglib2.0-0 \
-            libgtk-3-0 \
-            libnspr4 \
-            libnss3 \
-            libpango-1.0-0 \
-            libpangocairo-1.0-0 \
-            libstdc++6 \
-            libx11-6 \
-            libx11-xcb1 \
-            libxcb1 \
-            libxcomposite1 \
-            libxcursor1 \
-            libxdamage1 \
-            libxext6 \
-            libxfixes3 \
-            libxi6 \
-            libxrandr2 \
-            libxrender1 \
-            libxss1 \
-            libxtst6 \
-            lsb-release \
-            wget \
-            xdg-utils \
-            libu2f-udev \
-            libvulkan1
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
 
-      - name: Install Puppeteer
-        run: |
-          npm init -y
-          npm install puppeteer
+      - name: Install ADB
+        run: sudo apt-get update -qq && sudo apt-get install -y adb
 
-      - name: Run VMOS Cloud automation
-        id: automation
+      - name: Run Automation
         env:
           PHONE_NUMBER: ${{ inputs.phone_number }}
           TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
           WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
           WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          # Allow Puppeteer to download Chromium
-          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'false'
-        run: |
-          echo "[START] Running VMOS Cloud automation script"
-          node .github/scripts/wa_register.js
-          echo "[END] Automation script completed"
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          target: google_apis_playstore
+          arch: x86_64
+          profile: pixel_4
+          emulator-options: -no-window -gpu swiftshader -no-snapshot -noaudio -no-boot-anim -memory 4096
+          script: node .github/scripts/wa_register.js
 
-      - name: Upload screenshots (if available)
+      - name: Upload Screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vmos-screenshots-${{ github.run_id }}
+          name: screenshots-${{ github.run_id }}
           path: /tmp/vmos_*.png
-          retention-days: 1
           if-no-files-found: ignore
-
-      - name: Notify bot — automation failed
-        if: failure()
-        env:
-          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
-          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
-          PHONE_NUMBER: ${{ inputs.phone_number }}
-          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          echo "[FAILURE] VMOS automation failed for $PHONE_NUMBER"
-          curl -s -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
-            -d "{
-              \"event\": \"bad_number\",
-              \"phone_number\": \"$PHONE_NUMBER\",
-              \"telegram_user_id\": $TELEGRAM_USER_ID,
-              \"run_id\": \"$GITHUB_RUN_ID\",
-              \"reason\": \"VMOS Cloud automation failed — browser or navigation error\"
-            }"
-
-      - name: Notify bot — workflow cancelled
-        if: cancelled()
-        env:
-          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
-          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
-          PHONE_NUMBER: ${{ inputs.phone_number }}
-          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          echo "[CANCELLED] VMOS automation cancelled for $PHONE_NUMBER"
-          curl -s -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
-            -d "{
-              \"event\": \"bad_number\",
-              \"phone_number\": \"$PHONE_NUMBER\",
-              \"telegram_user_id\": $TELEGRAM_USER_ID,
-              \"run_id\": \"$GITHUB_RUN_ID\",
-              \"reason\": \"GitHub Actions workflow was cancelled\"
-            }"
