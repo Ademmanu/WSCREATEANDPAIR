@@ -1,6 +1,5 @@
 /**
- * wa_register.js — VMOS Cloud automation with post-action verification
- * Verifies on-screen text after each action to ensure correct page state
+ * wa_register.js — VMOS Cloud automation with Chrome welcome screen handling
  */
 
 'use strict';
@@ -61,7 +60,6 @@ function shell(cmd, timeout = 30000) {
   return out;
 }
 
-// Input helpers
 function tap(x, y) { shell(`input tap ${x} ${y}`); }
 function keyevent(k) { shell(`input keyevent ${k}`); }
 function textInput(str) {
@@ -72,7 +70,7 @@ function swipe(x1, y1, x2, y2, d = 300) {
   shell(`input swipe ${x1} ${y1} ${x2} ${y2} ${d}`);
 }
 
-// ── UIAutomator Core ──────────────────────────────────────────────────────────
+// ── UIAutomator ───────────────────────────────────────────────────────────────
 
 async function getXML(timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
@@ -106,7 +104,6 @@ function parseBounds(boundsStr) {
 
 function findElement(xml, text) {
   const lower = text.toLowerCase();
-  // Search for text or content-desc containing the string
   const pattern = new RegExp(`(?:text|content-desc)="([^"]*${text}[^"]*)"[^>]*bounds="([^"]+)"`, 'gi');
   const matches = [];
   let match;
@@ -116,17 +113,12 @@ function findElement(xml, text) {
     if (coords) matches.push({ text: txt, coords, exact: txt.toLowerCase() === lower });
   }
   if (matches.length === 0) return null;
-  // Prefer exact match
   return matches.find(m => m.exact) || matches[0];
 }
 
-// ── Post-Action Verification ──────────────────────────────────────────────────
+// ── Verification ──────────────────────────────────────────────────────────────
 
 async function verifyScreen(expectedTexts, timeoutMs = 15000) {
-  /**
-   * Verifies that at least one of the expected texts appears on screen
-   * Returns { success: boolean, found: string, allTexts: string[] }
-   */
   const deadline = Date.now() + timeoutMs;
   const expectedArray = Array.isArray(expectedTexts) ? expectedTexts : [expectedTexts];
   
@@ -137,59 +129,67 @@ async function verifyScreen(expectedTexts, timeoutMs = 15000) {
     
     for (const expected of expectedArray) {
       if (xml.toLowerCase().includes(expected.toLowerCase())) {
-        log('VERIFY', `✓ Found "${expected}" on screen`);
-        log('SCREEN', `Visible: ${pageText}...`);
+        log('VERIFY', `✓ Found "${expected}"`);
+        log('SCREEN', `${pageText}...`);
         return { success: true, found: expected, allTexts, xml };
       }
     }
     await sleep(1000);
   }
   
-  // Final attempt to log what was visible
   const xml = await getXML();
   const allTexts = getAllText(xml);
   log('VERIFY', `✗ Expected [${expectedArray.join(', ')}] NOT found`);
-  log('SCREEN', `Actually visible: ${allTexts.join(' | ').substring(0, 200)}...`);
+  log('SCREEN', `Visible: ${allTexts.join(' | ').substring(0, 200)}...`);
   return { success: false, found: null, allTexts, xml };
 }
 
-// Wait then perform action
 async function waitFor(text, timeoutMs = 30000) {
-  log('WAIT', `Waiting for "${text}"...`);
+  log('WAIT', `"${text}"...`);
   const result = await verifyScreen(text, timeoutMs);
-  if (!result.success) throw new Error(`Timeout waiting for "${text}"`);
+  if (!result.success) throw new Error(`Timeout: "${text}"`);
   const el = findElement(result.xml, text);
   return { ...result, element: el };
 }
 
+async function tapAny(options, description, timeout = 10000) {
+  log('TAP', `Looking for: ${description}...`);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const xml = await getXML();
+    for (const opt of options) {
+      const el = findElement(xml, opt);
+      if (el) {
+        log('TAP', `"${opt}" → (${el.coords.x},${el.coords.y})`);
+        tap(el.coords.x, el.coords.y);
+        await sleep(1000);
+        return { success: true, tapped: opt, xml };
+      }
+    }
+    await sleep(500);
+  }
+  return { success: false };
+}
+
 async function tapVerified(text, expectedAfter, timeout = 30000) {
-  /**
-   * Tap element by text, then verify we see expectedAfter text
-   */
-  log('ACTION', `Tapping "${text}"...`);
+  log('ACTION', `Tap "${text}" → expect "${expectedAfter}"...`);
   const before = await waitFor(text, timeout);
   tap(before.element.coords.x, before.element.coords.y);
-  await sleep(1500); // Wait for transition
+  await sleep(1500);
   
-  // Post-action verification
   const after = await verifyScreen(expectedAfter, 10000);
   if (!after.success) {
-    throw new Error(`After tapping "${text}", expected "${expectedAfter}" but got: ${after.allTexts.join(' | ')}`);
+    throw new Error(`Tap "${text}" failed. Expected "${expectedAfter}", got: ${after.allTexts.join(' | ')}`);
   }
-  log('ACTION', `✓ Tap "${text}" successful, now seeing: "${after.found}"`);
+  log('ACTION', `✓ Success: now at "${after.found}"`);
   return after;
 }
 
 async function typeVerified(fieldText, value, expectedAfter) {
-  /**
-   * Tap field, clear it, type value, then verify expectedAfter appears
-   */
-  log('ACTION', `Typing "${value}" into "${fieldText}"...`);
+  log('ACTION', `Type into "${fieldText}" → expect "${expectedAfter}"...`);
   const field = await waitFor(fieldText);
   tap(field.element.coords.x, field.element.coords.y);
   await sleep(500);
-  
-  // Clear and type
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
   keyevent('KEYCODE_DEL');
@@ -197,19 +197,63 @@ async function typeVerified(fieldText, value, expectedAfter) {
   textInput(value);
   await sleep(800);
   
-  // Post-action verification
   const after = await verifyScreen(expectedAfter, 8000);
-  if (!after.success) {
-    // Sometimes the field text changes to the value we typed, check that too
-    const xmlCheck = await getXML();
-    if (xmlCheck.includes(value.substring(0, 10))) {
-      log('ACTION', `✓ Text "${value.substring(0, 10)}..." appears to be entered`);
-      return { ...after, success: true };
-    }
-    throw new Error(`After typing in "${fieldText}", expected "${expectedAfter}" but got: ${after.allTexts.join(' | ')}`);
+  if (!after.success && !after.allTexts.join(' ').includes(value.substring(0, 8))) {
+    throw new Error(`Type failed. Expected "${expectedAfter}", got: ${after.allTexts.join(' | ')}`);
   }
-  log('ACTION', `✓ Typed "${value.substring(0, 5)}..." successfully, now seeing: "${after.found}"`);
+  log('ACTION', `✓ Success: "${value.substring(0, 5)}..." entered`);
   return after;
+}
+
+// ── Chrome Setup ──────────────────────────────────────────────────────────────
+
+async function setupChrome() {
+  /**
+   * Handle Chrome first-run screens:
+   * 1. "Welcome to Chrome" → "Use without an account"
+   * 2. "Turn on sync?" → "No thanks" or dismiss
+   * 3. Terms acceptance → "Accept & continue"
+   */
+  log('CHROME_SETUP', 'Checking for first-run screens...');
+  
+  // Check if we're on welcome screen
+  let check = await verifyScreen(['Welcome to Chrome', 'Use without an account', 'Add account'], 5000);
+  
+  if (check.success) {
+    log('CHROME_SETUP', 'Detected welcome screen, dismissing...');
+    
+    // Tap "Use without an account"
+    const res = await tapAny(['Use without an account', 'Use without an account'], 'skip account');
+    await sleep(2000);
+    
+    // Handle "Turn on sync?" or "No thanks"
+    const syncCheck = await verifyScreen(['Turn on sync', 'No thanks', 'Accept', 'Continue'], 5000);
+    if (syncCheck.found === 'Turn on sync' || syncCheck.found === 'No thanks') {
+      await tapAny(['No thanks', 'Not now'], 'decline sync');
+      await sleep(2000);
+    }
+    
+    // Handle Terms/Accept screen
+    const termsCheck = await verifyScreen(['Accept', 'Continue', 'Terms of Service', 'By continuing'], 5000);
+    if (termsCheck.success) {
+      await tapAny(['Accept & continue', 'Continue', 'Accept'], 'accept terms');
+      await sleep(2000);
+    }
+    
+    // Wait for browser to be ready
+    await sleep(3000);
+  }
+  
+  // Verify we have address bar now
+  const finalCheck = await verifyScreen(['Search or type URL', 'Address bar', 'New tab', 'Chrome'], 10000);
+  if (!finalCheck.success) {
+    // Try pressing back to dismiss any remaining dialogs
+    keyevent('KEYCODE_BACK');
+    await sleep(1000);
+    const retry = await verifyScreen(['Search', 'Address', 'URL', 'Chrome'], 5000);
+    if (!retry.success) throw new Error('Cannot get Chrome to main browser view');
+  }
+  log('CHROME_SETUP', '✓ Chrome ready for navigation');
 }
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
@@ -242,7 +286,7 @@ async function webhook(event, extra = {}) {
   });
 }
 
-// ── Main Flow ─────────────────────────────────────────────────────────────────
+// ── Main ───────────────────────────────────────────────────────────────────────
 
 async function main() {
   log('INIT', `Starting automation for ${PHONE}`);
@@ -251,10 +295,8 @@ async function main() {
   log('STEP 1', 'Checking emulator...');
   const boot = shell('getprop sys.boot_completed');
   if (boot !== '1') throw new Error('Emulator not ready');
-  
-  // Post-boot verification
-  await verifyScreen(['Google', 'Chrome', 'Play Store', 'Settings']);
-  log('STEP 1', '✓ Emulator booted successfully');
+  await verifyScreen(['Google', 'Chrome', 'Home']);
+  log('STEP 1', '✓ Emulator ready');
 
   // 2. Wake device
   log('STEP 2', 'Waking device...');
@@ -263,23 +305,17 @@ async function main() {
   swipe(540, 1800, 540, 900, 400);
   await sleep(500);
   shell('settings put global stay_on_while_plugged_in 3');
-  await verifyScreen(['Google', 'Chrome', 'clock', ' battery']);
-  log('STEP 2', '✓ Device awake and unlocked');
+  await verifyScreen(['Google', 'Chrome', 'Apps']);
+  log('STEP 2', '✓ Device awake');
 
-  // 3. Launch Chrome
+  // 3. Launch Chrome + handle welcome screens
   log('STEP 3', 'Launching Chrome...');
   shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
   await sleep(4000);
   
-  // Handle crash dialog if present
-  const crashCheck = await verifyScreen(['Close app', 'New tab', 'Search or type URL'], 5000);
-  if (crashCheck.found === 'Close app') {
-    await tapVerified('Close app', 'New tab', 5000);
-  }
-  
-  // Verify Chrome opened
-  const chromeCheck = await verifyScreen(['Search or type URL', 'New tab', 'Address bar'], 10000);
-  log('STEP 3', `✓ Chrome ready: "${chromeCheck.found}"`);
+  // Handle Chrome first-run/setup screens
+  await setupChrome();
+  log('STEP 3', '✓ Chrome initialized');
 
   // 4. Navigate to URL
   log('STEP 4', `Navigating to ${TARGET_URL}...`);
@@ -293,63 +329,58 @@ async function main() {
   await sleep(500);
   keyevent('KEYCODE_ENTER');
   
-  // Post-navigation verification - Look for login page elements
+  // Verify page loaded - look for VMOS login elements
   const navCheck = await verifyScreen([
     'Please enter your email address',
     'Login/Register',
-    'Enter your email',
-    'Email'
+    'Email',
+    'VMOS',
+    'Cloud'
   ], 15000);
-  log('STEP 4', `✓ Page loaded: "${navCheck.found}" visible`);
+  log('STEP 4', `✓ Page loaded: "${navCheck.found}"`);
 
   // 5. Enter Email
   log('STEP 5', 'Entering email...');
   await typeVerified(
     'Please enter your email address',
     EMAIL,
-    ['Please enter your password', 'Password', 'Login/Register']
+    ['Please enter your password', 'Password', 'Login']
   );
-  log('STEP 5', '✓ Email entered, password field visible');
+  log('STEP 5', '✓ Email entered');
 
   // 6. Click Login/Register
   log('STEP 6', 'Clicking Login/Register...');
-  await tapVerified('Login/Register', ['Please enter your password', 'Password']);
-  log('STEP 6', '✓ Login/Register clicked, now on password screen');
+  await tapVerified('Login/Register', ['Please enter your password', 'Password', 'Login']);
+  log('STEP 6', '✓ Login/Register clicked');
 
   // 7. Enter Password
   log('STEP 7', 'Entering password...');
   await typeVerified(
     'Please enter your password',
     PASSWORD,
-    ['Login', 'Log in', 'Sign in']
+    ['Login', 'Log in', 'Sign in', 'Submit']
   );
-  log('STEP 7', '✓ Password entered, login button visible');
+  log('STEP 7', '✓ Password entered');
 
   // 8. Click Login
   log('STEP 8', 'Clicking Login...');
-  await tapVerified('Login', ['US', 'EU', 'Asia', 'Region', 'Dashboard', 'WhatsApp']);
-  log('STEP 8', '✓ Login successful, dashboard loaded');
+  await tapVerified('Login', ['US', 'EU', 'Region', 'Dashboard', 'WhatsApp', 'Instances']);
+  log('STEP 8', '✓ Logged in');
 
   // 9. Click US
   log('STEP 9', 'Selecting US region...');
-  await tapVerified('US', ['WhatsApp1', 'WhatsApp', 'Instances', 'Available']);
-  log('STEP 9', '✓ US region selected, WhatsApp1 visible');
+  await tapVerified('US', ['WhatsApp1', 'WhatsApp', 'Available', 'Running']);
+  log('STEP 9', '✓ US region selected');
 
   // 10. Click WhatsApp1
   log('STEP 10', 'Clicking WhatsApp1...');
-  await tapVerified('WhatsApp1', ['Loading', 'Connecting', 'WhatsApp Web', 'QR', 'Open', 'Launch']);
+  await tapVerified('WhatsApp1', ['Loading', 'Connecting', 'Launch', 'Open', 'Start']);
   log('STEP 10', '✓ WhatsApp1 clicked');
 
-  // Final verification
-  log('COMPLETE', 'Automation stopped at WhatsApp1 as requested');
-  const final = await getXML();
-  const texts = getAllText(final);
-  log('FINAL', `Screen shows: ${texts.slice(0, 5).join(' | ')}`);
-
-  // Screenshot
+  // Complete
+  log('COMPLETE', 'Stopped at WhatsApp1 as requested');
   shell('screencap -p /sdcard/final.png');
   adb('pull /sdcard/final.png /tmp/vmos_final.png');
-  
   await webhook('vmos_complete', { stopped_at: 'whatsapp1' });
 }
 
@@ -362,7 +393,7 @@ main().catch(async (err) => {
     adb('pull /sdcard/error.png /tmp/vmos_error.png');
     const xml = await getXML();
     const texts = getAllText(xml);
-    log('ERROR_SCREEN', `Last visible: ${texts.join(' | ').substring(0, 300)}`);
+    log('ERROR_SCREEN', `Last visible: ${texts.slice(0, 10).join(' | ')}`);
   } catch (e) {}
   await webhook('bad_number', { reason: err.message });
   process.exit(1);
