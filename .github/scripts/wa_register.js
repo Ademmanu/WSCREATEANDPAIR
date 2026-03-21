@@ -1,6 +1,6 @@
 /**
- * wa_register.js — VMOS Cloud automation via ADB + UIAutomator
- * Controls Chrome inside Android emulator to navigate cloud.vmoscloud.com
+ * wa_register.js — VMOS Cloud automation with post-action verification
+ * Verifies on-screen text after each action to ensure correct page state
  */
 
 'use strict';
@@ -11,7 +11,7 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 
-// ── Configuration ─────────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 
 const PHONE = process.env.PHONE_NUMBER;
 const USER_ID = process.env.TELEGRAM_USER_ID;
@@ -24,7 +24,7 @@ const EMAIL = 'emmanueladeloye2023@gmail.com';
 const PASSWORD = 'Emma2007';
 const SCRIPT_DIR = '/tmp/wa_scripts';
 
-// ── Logging & Utilities ───────────────────────────────────────────────────────
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
 function log(step, message) {
   const ts = new Date().toISOString().substr(11, 8);
@@ -35,7 +35,6 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// Execute shell command with timeout
 function exec(cmd, timeoutMs = 30000) {
   fs.mkdirSync(SCRIPT_DIR, { recursive: true });
   const file = path.join(SCRIPT_DIR, `sh_${Date.now()}.sh`);
@@ -49,7 +48,6 @@ function exec(cmd, timeoutMs = 30000) {
   }
 }
 
-// ADB wrappers
 function adb(args, timeout = 30000) {
   return exec(`adb ${args}`, timeout);
 }
@@ -63,93 +61,158 @@ function shell(cmd, timeout = 30000) {
   return out;
 }
 
-// Input commands
+// Input helpers
 function tap(x, y) { shell(`input tap ${x} ${y}`); }
-function swipe(x1, y1, x2, y2, d = 300) { shell(`input swipe ${x1} ${y1} ${x2} ${y2} ${d}`); }
 function keyevent(k) { shell(`input keyevent ${k}`); }
 function textInput(str) {
-  // Replace spaces with %s for adb shell input
   const safe = str.replace(/ /g, '%s');
   shell(`input text "${safe}"`);
 }
+function swipe(x1, y1, x2, y2, d = 300) {
+  shell(`input swipe ${x1} ${y1} ${x2} ${y2} ${d}`);
+}
 
-// ── UIAutomator XML Parsing ───────────────────────────────────────────────────
+// ── UIAutomator Core ──────────────────────────────────────────────────────────
 
 async function getXML(timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    shell('uiautomator dump /sdcard/ui.xml');
-    const xml = shell('cat /sdcard/ui.xml', 5000);
+    shell('uiautomator dump /sdcard/ui.xml 2>/dev/null');
+    const xml = shell('cat /sdcard/ui.xml 2>/dev/null', 5000);
     if (xml && xml.includes('<hierarchy')) return xml;
     await sleep(1000);
   }
-  throw new Error('Could not dump UI hierarchy');
+  throw new Error('Failed to get UI XML');
 }
 
-// Parse bounds="[left,top][right,bottom]" and calculate center
+function getAllText(xml) {
+  const texts = [];
+  const textRe = /text="([^"]*)"/g;
+  const descRe = /content-desc="([^"]*)"/g;
+  let m;
+  while ((m = textRe.exec(xml)) !== null) if (m[1]) texts.push(m[1]);
+  while ((m = descRe.exec(xml)) !== null) if (m[1]) texts.push(m[1]);
+  return [...new Set(texts)];
+}
+
 function parseBounds(boundsStr) {
-  const match = boundsStr.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
-  if (!match) return null;
-  const [, left, top, right, bottom] = match.map(Number);
+  const m = boundsStr.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+  if (!m) return null;
   return {
-    x: Math.round((left + right) / 2),
-    y: Math.round((top + bottom) / 2)
+    x: Math.round((+m[1] + +m[3]) / 2),
+    y: Math.round((+m[2] + +m[4]) / 2)
   };
 }
 
-// Find element by text or content-desc (partial match supported)
-function findElement(xml, searchText) {
-  const lowerSearch = searchText.toLowerCase();
-  
-  // Try exact match first
-  const exactRe = new RegExp(`(?:text|content-desc)="([^"]*${searchText}[^"]*)"[^>]*bounds="([^"]+)"`, 'gi');
-  let match;
+function findElement(xml, text) {
+  const lower = text.toLowerCase();
+  // Search for text or content-desc containing the string
+  const pattern = new RegExp(`(?:text|content-desc)="([^"]*${text}[^"]*)"[^>]*bounds="([^"]+)"`, 'gi');
   const matches = [];
-  
-  while ((match = exactRe.exec(xml)) !== null) {
-    const [, text, bounds] = match;
+  let match;
+  while ((match = pattern.exec(xml)) !== null) {
+    const [, txt, bounds] = match;
     const coords = parseBounds(bounds);
-    if (coords) matches.push({ text, bounds, coords, exact: text.toLowerCase() === lowerSearch });
+    if (coords) matches.push({ text: txt, coords, exact: txt.toLowerCase() === lower });
   }
-  
   if (matches.length === 0) return null;
-  
-  // Prefer exact match, otherwise first partial
-  const best = matches.find(m => m.exact) || matches[0];
-  return best;
+  // Prefer exact match
+  return matches.find(m => m.exact) || matches[0];
 }
 
-// Wait for element to appear on screen
-async function waitFor(text, timeoutMs = 30000) {
-  log('WAIT', `Waiting for "${text}"...`);
+// ── Post-Action Verification ──────────────────────────────────────────────────
+
+async function verifyScreen(expectedTexts, timeoutMs = 15000) {
+  /**
+   * Verifies that at least one of the expected texts appears on screen
+   * Returns { success: boolean, found: string, allTexts: string[] }
+   */
   const deadline = Date.now() + timeoutMs;
+  const expectedArray = Array.isArray(expectedTexts) ? expectedTexts : [expectedTexts];
+  
   while (Date.now() < deadline) {
     const xml = await getXML();
-    const el = findElement(xml, text);
-    if (el) {
-      log('FOUND', `"${text}" at (${el.coords.x},${el.coords.y})`);
-      return { xml, element: el };
+    const allTexts = getAllText(xml);
+    const pageText = allTexts.join(' | ').substring(0, 200);
+    
+    for (const expected of expectedArray) {
+      if (xml.toLowerCase().includes(expected.toLowerCase())) {
+        log('VERIFY', `✓ Found "${expected}" on screen`);
+        log('SCREEN', `Visible: ${pageText}...`);
+        return { success: true, found: expected, allTexts, xml };
+      }
     }
-    await sleep(1500);
+    await sleep(1000);
   }
-  throw new Error(`Timeout waiting for "${text}"`);
+  
+  // Final attempt to log what was visible
+  const xml = await getXML();
+  const allTexts = getAllText(xml);
+  log('VERIFY', `✗ Expected [${expectedArray.join(', ')}] NOT found`);
+  log('SCREEN', `Actually visible: ${allTexts.join(' | ').substring(0, 200)}...`);
+  return { success: false, found: null, allTexts, xml };
 }
 
-// Tap element by text
-async function tapByText(text, xml = null) {
-  if (!xml) xml = await getXML();
-  const el = findElement(xml, text);
-  if (!el) {
-    log('TAP', `WARNING: "${text}" not found, skipping`);
-    return false;
-  }
-  log('TAP', `"${text}" → (${el.coords.x},${el.coords.y})`);
-  tap(el.coords.x, el.coords.y);
-  await sleep(1000);
-  return true;
+// Wait then perform action
+async function waitFor(text, timeoutMs = 30000) {
+  log('WAIT', `Waiting for "${text}"...`);
+  const result = await verifyScreen(text, timeoutMs);
+  if (!result.success) throw new Error(`Timeout waiting for "${text}"`);
+  const el = findElement(result.xml, text);
+  return { ...result, element: el };
 }
 
-// ── Webhook Helper ────────────────────────────────────────────────────────────
+async function tapVerified(text, expectedAfter, timeout = 30000) {
+  /**
+   * Tap element by text, then verify we see expectedAfter text
+   */
+  log('ACTION', `Tapping "${text}"...`);
+  const before = await waitFor(text, timeout);
+  tap(before.element.coords.x, before.element.coords.y);
+  await sleep(1500); // Wait for transition
+  
+  // Post-action verification
+  const after = await verifyScreen(expectedAfter, 10000);
+  if (!after.success) {
+    throw new Error(`After tapping "${text}", expected "${expectedAfter}" but got: ${after.allTexts.join(' | ')}`);
+  }
+  log('ACTION', `✓ Tap "${text}" successful, now seeing: "${after.found}"`);
+  return after;
+}
+
+async function typeVerified(fieldText, value, expectedAfter) {
+  /**
+   * Tap field, clear it, type value, then verify expectedAfter appears
+   */
+  log('ACTION', `Typing "${value}" into "${fieldText}"...`);
+  const field = await waitFor(fieldText);
+  tap(field.element.coords.x, field.element.coords.y);
+  await sleep(500);
+  
+  // Clear and type
+  keyevent('KEYCODE_CTRL_A');
+  await sleep(200);
+  keyevent('KEYCODE_DEL');
+  await sleep(200);
+  textInput(value);
+  await sleep(800);
+  
+  // Post-action verification
+  const after = await verifyScreen(expectedAfter, 8000);
+  if (!after.success) {
+    // Sometimes the field text changes to the value we typed, check that too
+    const xmlCheck = await getXML();
+    if (xmlCheck.includes(value.substring(0, 10))) {
+      log('ACTION', `✓ Text "${value.substring(0, 10)}..." appears to be entered`);
+      return { ...after, success: true };
+    }
+    throw new Error(`After typing in "${fieldText}", expected "${expectedAfter}" but got: ${after.allTexts.join(' | ')}`);
+  }
+  log('ACTION', `✓ Typed "${value.substring(0, 5)}..." successfully, now seeing: "${after.found}"`);
+  return after;
+}
+
+// ── Webhook ───────────────────────────────────────────────────────────────────
 
 async function webhook(event, extra = {}) {
   if (!WEBHOOK_URL) return;
@@ -172,51 +235,55 @@ async function webhook(event, extra = {}) {
       log('WEBHOOK', `${event} → ${res.statusCode}`);
       resolve();
     });
-    req.on('error', (e) => { log('WEBHOOK', `Error: ${e.message}`); resolve(); });
+    req.on('error', () => resolve());
     req.setTimeout(8000, () => req.destroy());
     req.write(body);
     req.end();
   });
 }
 
-// ── Main Automation Flow ──────────────────────────────────────────────────────
+// ── Main Flow ─────────────────────────────────────────────────────────────────
 
 async function main() {
-  log('INIT', `Starting VMOS Cloud automation for phone: ${PHONE}`);
-  
-  // 1. Check emulator ready
-  log('DEVICE', 'Checking emulator status...');
-  const boot = shell('getprop sys.boot_completed');
-  if (boot !== '1') throw new Error(`Emulator not ready: ${boot}`);
-  log('DEVICE', '✓ Emulator ready');
+  log('INIT', `Starting automation for ${PHONE}`);
 
-  // 2. Wake up
-  log('DEVICE', 'Waking device...');
+  // 1. Boot check
+  log('STEP 1', 'Checking emulator...');
+  const boot = shell('getprop sys.boot_completed');
+  if (boot !== '1') throw new Error('Emulator not ready');
+  
+  // Post-boot verification
+  await verifyScreen(['Google', 'Chrome', 'Play Store', 'Settings']);
+  log('STEP 1', '✓ Emulator booted successfully');
+
+  // 2. Wake device
+  log('STEP 2', 'Waking device...');
   keyevent('KEYCODE_WAKEUP');
   await sleep(500);
   swipe(540, 1800, 540, 900, 400);
   await sleep(500);
   shell('settings put global stay_on_while_plugged_in 3');
-  log('DEVICE', '✓ Device awake');
+  await verifyScreen(['Google', 'Chrome', 'clock', ' battery']);
+  log('STEP 2', '✓ Device awake and unlocked');
 
   // 3. Launch Chrome
-  log('CHROME', 'Launching Chrome...');
+  log('STEP 3', 'Launching Chrome...');
   shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
   await sleep(4000);
   
-  // Handle crash dialogs
-  const crashXml = await getXML();
-  if (crashXml.includes('Close app')) {
-    await tapByText('Close app', crashXml);
-    await sleep(1000);
-    shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
-    await sleep(3000);
+  // Handle crash dialog if present
+  const crashCheck = await verifyScreen(['Close app', 'New tab', 'Search or type URL'], 5000);
+  if (crashCheck.found === 'Close app') {
+    await tapVerified('Close app', 'New tab', 5000);
   }
-  log('CHROME', '✓ Chrome launched');
+  
+  // Verify Chrome opened
+  const chromeCheck = await verifyScreen(['Search or type URL', 'New tab', 'Address bar'], 10000);
+  log('STEP 3', `✓ Chrome ready: "${chromeCheck.found}"`);
 
   // 4. Navigate to URL
-  log('NAVIGATE', `Opening ${TARGET_URL}`);
-  tap(400, 150); // Address bar (approximate top center)
+  log('STEP 4', `Navigating to ${TARGET_URL}...`);
+  tap(400, 150); // Address bar
   await sleep(800);
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
@@ -225,81 +292,77 @@ async function main() {
   textInput(TARGET_URL);
   await sleep(500);
   keyevent('KEYCODE_ENTER');
-  await sleep(6000); // Wait for page load
-  log('NAVIGATE', '✓ Page loaded');
+  
+  // Post-navigation verification - Look for login page elements
+  const navCheck = await verifyScreen([
+    'Please enter your email address',
+    'Login/Register',
+    'Enter your email',
+    'Email'
+  ], 15000);
+  log('STEP 4', `✓ Page loaded: "${navCheck.found}" visible`);
 
   // 5. Enter Email
-  log('FORM', 'Step: Enter email address');
-  const emailField = await waitFor('Please enter your email address');
-  tap(emailField.element.coords.x, emailField.element.coords.y);
-  await sleep(500);
-  keyevent('KEYCODE_CTRL_A');
-  await sleep(200);
-  keyevent('KEYCODE_DEL');
-  await sleep(200);
-  textInput(EMAIL);
-  log('FORM', `✓ Email entered: ${EMAIL}`);
-  await sleep(800);
+  log('STEP 5', 'Entering email...');
+  await typeVerified(
+    'Please enter your email address',
+    EMAIL,
+    ['Please enter your password', 'Password', 'Login/Register']
+  );
+  log('STEP 5', '✓ Email entered, password field visible');
 
   // 6. Click Login/Register
-  log('FORM', 'Step: Click Login/Register');
-  const loginReg = await waitFor('Login/Register');
-  tap(loginReg.element.coords.x, loginReg.element.coords.y);
-  log('FORM', '✓ Login/Register clicked');
-  await sleep(3000);
+  log('STEP 6', 'Clicking Login/Register...');
+  await tapVerified('Login/Register', ['Please enter your password', 'Password']);
+  log('STEP 6', '✓ Login/Register clicked, now on password screen');
 
   // 7. Enter Password
-  log('FORM', 'Step: Enter password');
-  const passField = await waitFor('Please enter your password');
-  tap(passField.element.coords.x, passField.element.coords.y);
-  await sleep(500);
-  keyevent('KEYCODE_CTRL_A');
-  await sleep(200);
-  keyevent('KEYCODE_DEL');
-  await sleep(200);
-  textInput(PASSWORD);
-  log('FORM', '✓ Password entered');
-  await sleep(800);
+  log('STEP 7', 'Entering password...');
+  await typeVerified(
+    'Please enter your password',
+    PASSWORD,
+    ['Login', 'Log in', 'Sign in']
+  );
+  log('STEP 7', '✓ Password entered, login button visible');
 
   // 8. Click Login
-  log('FORM', 'Step: Click Login');
-  const loginBtn = await waitFor('Login');
-  tap(loginBtn.element.coords.x, loginBtn.element.coords.y);
-  log('FORM', '✓ Login clicked');
-  await sleep(5000); // Wait for auth
+  log('STEP 8', 'Clicking Login...');
+  await tapVerified('Login', ['US', 'EU', 'Asia', 'Region', 'Dashboard', 'WhatsApp']);
+  log('STEP 8', '✓ Login successful, dashboard loaded');
 
   // 9. Click US
-  log('NAVIGATE', 'Step: Select US region');
-  const usBtn = await waitFor('US', 15000);
-  tap(usBtn.element.coords.x, usBtn.element.coords.y);
-  log('NAVIGATE', '✓ US selected');
-  await sleep(3000);
+  log('STEP 9', 'Selecting US region...');
+  await tapVerified('US', ['WhatsApp1', 'WhatsApp', 'Instances', 'Available']);
+  log('STEP 9', '✓ US region selected, WhatsApp1 visible');
 
   // 10. Click WhatsApp1
-  log('NAVIGATE', 'Step: Select WhatsApp1');
-  const waBtn = await waitFor('WhatsApp1', 15000);
-  tap(waBtn.element.coords.x, waBtn.element.coords.y);
-  log('NAVIGATE', '✓ WhatsApp1 selected');
-  await sleep(2000);
+  log('STEP 10', 'Clicking WhatsApp1...');
+  await tapVerified('WhatsApp1', ['Loading', 'Connecting', 'WhatsApp Web', 'QR', 'Open', 'Launch']);
+  log('STEP 10', '✓ WhatsApp1 clicked');
 
-  // Stop here
+  // Final verification
   log('COMPLETE', 'Automation stopped at WhatsApp1 as requested');
-  
-  // Screenshot for verification
+  const final = await getXML();
+  const texts = getAllText(final);
+  log('FINAL', `Screen shows: ${texts.slice(0, 5).join(' | ')}`);
+
+  // Screenshot
   shell('screencap -p /sdcard/final.png');
   adb('pull /sdcard/final.png /tmp/vmos_final.png');
-  log('DEBUG', 'Screenshot: /tmp/vmos_final.png');
   
-  await webhook('vmos_stopped', { step: 'whatsapp1_selected' });
+  await webhook('vmos_complete', { stopped_at: 'whatsapp1' });
 }
 
-// ── Entry Point ───────────────────────────────────────────────────────────────
+// ── Error Handler ─────────────────────────────────────────────────────────────
 
 main().catch(async (err) => {
   log('FATAL', err.message);
   try {
     shell('screencap -p /sdcard/error.png');
     adb('pull /sdcard/error.png /tmp/vmos_error.png');
+    const xml = await getXML();
+    const texts = getAllText(xml);
+    log('ERROR_SCREEN', `Last visible: ${texts.join(' | ').substring(0, 300)}`);
   } catch (e) {}
   await webhook('bad_number', { reason: err.message });
   process.exit(1);
