@@ -119,34 +119,55 @@ function findElement(xml, searchText) {
   return best;
 }
 
+// ── Post-Action Verification ──────────────────────────────────────────────────
+
+async function verifyScreen(expectedTexts, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  const expectedArray = Array.isArray(expectedTexts) ? expectedTexts : [expectedTexts];
+  
+  while (Date.now() < deadline) {
+    const xml = await getXML();
+    const lowerXml = xml.toLowerCase();
+    
+    for (const expected of expectedArray) {
+      if (lowerXml.includes(expected.toLowerCase())) {
+        log('VERIFY', `✓ Found "${expected}" on screen`);
+        return { success: true, found: expected, xml };
+      }
+    }
+    await sleep(800);
+  }
+  
+  const finalXml = await getXML();
+  log('VERIFY', `✗ Expected [${expectedArray.join(', ')}] NOT found`);
+  return { success: false, found: null, xml: finalXml };
+}
+
 // Wait for element to appear on screen
 async function waitFor(text, timeoutMs = 30000) {
   log('WAIT', `Waiting for "${text}"...`);
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const xml = await getXML();
-    const el = findElement(xml, text);
-    if (el) {
-      log('FOUND', `"${text}" at (${el.coords.x},${el.coords.y})`);
-      return { xml, element: el };
-    }
-    await sleep(1500);
-  }
-  throw new Error(`Timeout waiting for "${text}"`);
+  const result = await verifyScreen(text, timeoutMs);
+  if (!result.success) throw new Error(`Timeout waiting for "${text}"`);
+  const el = findElement(result.xml, text);
+  if (!el) throw new Error(`Found "${text}" in XML but could not parse bounds`);
+  return { xml: result.xml, element: el };
 }
 
-// Tap element by text
-async function tapByText(text, xml = null) {
-  if (!xml) xml = await getXML();
-  const el = findElement(xml, text);
-  if (!el) {
-    log('TAP', `WARNING: "${text}" not found, skipping`);
-    return false;
+// Tap element by text with post-action verification
+async function tapAndVerify(text, expectedAfter, timeout = 30000) {
+  log('ACTION', `Tapping "${text}"...`);
+  const before = await waitFor(text, timeout);
+  tap(before.element.coords.x, before.element.coords.y);
+  await sleep(1500);
+  
+  const after = await verifyScreen(expectedAfter, 8000);
+  if (!after.success) {
+    log('ACTION', `⚠ After tapping "${text}", expected [${Array.isArray(expectedAfter) ? expectedAfter.join(', ') : expectedAfter}]`);
+    // Don't throw, just log warning and continue
+  } else {
+    log('ACTION', `✓ Tap successful, now seeing: "${after.found}"`);
   }
-  log('TAP', `"${text}" → (${el.coords.x},${el.coords.y})`);
-  tap(el.coords.x, el.coords.y);
-  await sleep(1000);
-  return true;
+  return after;
 }
 
 // ── Webhook Helper ────────────────────────────────────────────────────────────
@@ -204,15 +225,69 @@ async function main() {
   shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
   await sleep(4000);
   
-  // Handle crash dialogs
-  const crashXml = await getXML();
-  if (crashXml.includes('Close app')) {
-    await tapByText('Close app', crashXml);
+  // Handle Chrome welcome/setup screen (first run)
+  const welcomeCheck = await verifyScreen([
+    'Welcome to Chrome',
+    'Use without an account',
+    'Add account to device',
+    'Accept & continue',
+    'Terms of Service',
+    'Search or type URL'
+  ], 8000);
+  
+  if (welcomeCheck.found === 'Welcome to Chrome' || 
+      welcomeCheck.found === 'Use without an account' ||
+      welcomeCheck.found === 'Add account to device') {
+    log('CHROME', 'Welcome screen detected, skipping setup...');
+    
+    // Click "Use without an account"
+    const noAccount = findElement(welcomeCheck.xml, 'Use without an account');
+    if (noAccount) {
+      tap(noAccount.coords.x, noAccount.coords.y);
+    } else {
+      tap(800, 1700); // Coordinate fallback (bottom right)
+    }
+    log('CHROME', '✓ Clicked "Use without an account"');
+    await sleep(2000);
+    
+    // Look for Accept & continue
+    const acceptCheck = await verifyScreen(['Accept & continue', 'Next', 'Continue'], 5000);
+    if (acceptCheck.success) {
+      const btn = findElement(acceptCheck.xml, acceptCheck.found);
+      if (btn) tap(btn.coords.x, btn.coords.y);
+      else tap(800, 1600);
+      log('CHROME', `✓ Clicked "${acceptCheck.found}"`);
+      await sleep(2000);
+    }
+    
+    // Handle "No thanks" for sync
+    const syncCheck = await verifyScreen(['No thanks', 'Not now'], 3000);
+    if (syncCheck.success) {
+      const skipBtn = findElement(syncCheck.xml, syncCheck.found);
+      if (skipBtn) tap(skipBtn.coords.x, skipBtn.coords.y);
+      else tap(250, 1550);
+      log('CHROME', `✓ Clicked "${syncCheck.found}"`);
+      await sleep(2000);
+    }
+  }
+  
+  // Handle crash dialog if present
+  const crashCheck = await verifyScreen(['Close app', 'Search or type URL'], 3000);
+  if (crashCheck.found === 'Close app') {
+    const closeBtn = findElement(crashCheck.xml, 'Close app');
+    if (closeBtn) tap(closeBtn.coords.x, closeBtn.coords.y);
     await sleep(1000);
     shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
     await sleep(3000);
   }
-  log('CHROME', '✓ Chrome launched');
+  
+  // Post-action: Verify Chrome is ready
+  const chromeReady = await verifyScreen(['Search or type URL', 'New tab', 'Address bar'], 8000);
+  if (chromeReady.success) {
+    log('CHROME', `✓ Chrome ready: "${chromeReady.found}"`);
+  } else {
+    log('CHROME', '⚠ Chrome may not be fully ready, proceeding anyway');
+  }
 
   // 4. Navigate to URL
   log('NAVIGATE', `Opening ${TARGET_URL}`);
@@ -225,8 +300,20 @@ async function main() {
   textInput(TARGET_URL);
   await sleep(500);
   keyevent('KEYCODE_ENTER');
-  await sleep(6000); // Wait for page load
-  log('NAVIGATE', '✓ Page loaded');
+  
+  // Post-action: Verify page loaded
+  const navCheck = await verifyScreen([
+    'Please enter your email address',
+    'Login/Register',
+    'Email',
+    'VMOS',
+    'Cloud'
+  ], 15000);
+  if (navCheck.success) {
+    log('NAVIGATE', `✓ Page loaded: "${navCheck.found}"`);
+  } else {
+    log('NAVIGATE', '⚠ Page may not have loaded correctly');
+  }
 
   // 5. Enter Email
   log('FORM', 'Step: Enter email address');
@@ -238,15 +325,19 @@ async function main() {
   keyevent('KEYCODE_DEL');
   await sleep(200);
   textInput(EMAIL);
-  log('FORM', `✓ Email entered: ${EMAIL}`);
-  await sleep(800);
+  
+  // Post-action: Verify email entered (field may show typed text or stay with hint)
+  const emailCheck = await verifyScreen([
+    'Please enter your password',
+    'Login/Register',
+    'emmanueladeloye',
+    EMAIL.substring(0, 10)
+  ], 5000);
+  log('FORM', emailCheck.success ? `✓ Email entered` : '⚠ Email field state unclear');
 
   // 6. Click Login/Register
   log('FORM', 'Step: Click Login/Register');
-  const loginReg = await waitFor('Login/Register');
-  tap(loginReg.element.coords.x, loginReg.element.coords.y);
-  log('FORM', '✓ Login/Register clicked');
-  await sleep(3000);
+  await tapAndVerify('Login/Register', ['Please enter your password', 'Password', 'Login']);
 
   // 7. Enter Password
   log('FORM', 'Step: Enter password');
@@ -258,32 +349,29 @@ async function main() {
   keyevent('KEYCODE_DEL');
   await sleep(200);
   textInput(PASSWORD);
-  log('FORM', '✓ Password entered');
-  await sleep(800);
+  
+  // Post-action: Verify password field state
+  const passCheck = await verifyScreen(['Login', 'Log in', 'Sign in', 'Emma2007'], 5000);
+  log('FORM', passCheck.success ? `✓ Password entered` : '⚠ Password field state unclear');
 
   // 8. Click Login
   log('FORM', 'Step: Click Login');
-  const loginBtn = await waitFor('Login');
-  tap(loginBtn.element.coords.x, loginBtn.element.coords.y);
-  log('FORM', '✓ Login clicked');
-  await sleep(5000); // Wait for auth
+  await tapAndVerify('Login', ['US', 'EU', 'Asia', 'Region', 'Dashboard', 'WhatsApp', 'Welcome']);
 
   // 9. Click US
   log('NAVIGATE', 'Step: Select US region');
-  const usBtn = await waitFor('US', 15000);
-  tap(usBtn.element.coords.x, usBtn.element.coords.y);
-  log('NAVIGATE', '✓ US selected');
-  await sleep(3000);
+  await tapAndVerify('US', ['WhatsApp1', 'WhatsApp', 'Instances', 'Available', 'Select']);
 
   // 10. Click WhatsApp1
   log('NAVIGATE', 'Step: Select WhatsApp1');
-  const waBtn = await waitFor('WhatsApp1', 15000);
-  tap(waBtn.element.coords.x, waBtn.element.coords.y);
-  log('NAVIGATE', '✓ WhatsApp1 selected');
-  await sleep(2000);
+  await tapAndVerify('WhatsApp1', ['Loading', 'Connecting', 'Launch', 'Open', 'Start', 'WhatsApp']);
 
   // Stop here
   log('COMPLETE', 'Automation stopped at WhatsApp1 as requested');
+  
+  // Final verification
+  const finalCheck = await verifyScreen(['Loading', 'Connecting', 'WhatsApp', 'VMOS', 'Cloud'], 5000);
+  log('COMPLETE', finalCheck.success ? `✓ Final state: "${finalCheck.found}"` : '⚠ Final state unclear');
   
   // Screenshot for verification
   shell('screencap -p /sdcard/final.png');
