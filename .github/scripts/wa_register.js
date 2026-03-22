@@ -285,9 +285,9 @@ async function main() {
   ], 5000);
   log('POST-ACTION', chromeReady.success ? `✓ Chrome ready: "${chromeReady.found}"` : '⚠ Chrome state unclear');
 
-  // 5. Navigate to URL
+  // 5. Navigate to URL - FIXED: Tap more to the LEFT to avoid microphone
   log('STEP 5', `Navigating to ${TARGET_URL}...`);
-  tap(400, 150);
+  tap(200, 150); // CHANGED from (400, 150) to (200, 150) - left side of address bar
   await sleep(800);
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
