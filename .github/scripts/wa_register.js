@@ -220,15 +220,20 @@ async function main() {
   shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
   await sleep(4000);
   
-  // Handle welcome screen (ONE TIME setup)
-  const welcomeCheck = await verifyScreen([
-    'Welcome to Chrome',
-    'Use without an account',
-    'Add account to device'
-  ], 5000);
+  // POST-ACTION: Show screen FIRST, then handle welcome if needed
+  log('POST-ACTION', 'Verifying Chrome launched...');
+  const chromeTexts = await getVisibleText();
+  log('POST-ACTION', `Screen shows: ${chromeTexts.slice(0, 10).join(' | ')}`);
   
-  if (welcomeCheck.success) {
-    log('STEP 4', 'First run setup detected...');
+  // Check for welcome screen and handle if present
+  const hasWelcome = chromeTexts.some(t => 
+    t.includes('Welcome to Chrome') || 
+    t.includes('Use without an account') ||
+    t.includes('Add account to device')
+  );
+  
+  if (hasWelcome) {
+    log('STEP 4', 'First run setup detected, handling...');
     tap(800, 1700); // "Use without an account" - bottom right
     await sleep(2000);
     tap(800, 1600); // "Accept & continue" or "Next"
@@ -236,12 +241,13 @@ async function main() {
     tap(250, 1550); // "No thanks" for sync (left side)
     await sleep(2000);
     log('STEP 4', '✓ Setup completed');
+    
+    // Show screen after setup
+    const afterSetupTexts = await getVisibleText();
+    log('POST-ACTION', `After setup - Screen shows: ${afterSetupTexts.slice(0, 10).join(' | ')}`);
   }
   
-  // POST-ACTION: Verify Chrome ready
-  log('POST-ACTION', 'Verifying Chrome is ready...');
-  const chromeTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${chromeTexts.slice(0, 8).join(' | ')}`);
+  // Final Chrome ready check
   const chromeReady = await verifyScreen([
     'Search or type URL',
     'Search or type web address',
@@ -267,7 +273,7 @@ async function main() {
   // POST-ACTION: Verify page loaded
   log('POST-ACTION', 'Verifying page loaded...');
   const pageTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${pageTexts.slice(0, 8).join(' | ')}`);
+  log('POST-ACTION', `Screen shows: ${pageTexts.slice(0, 10).join(' | ')}`);
   const navCheck = await verifyScreen([
     'Please enter your email address',
     'Login/Register',
@@ -292,7 +298,7 @@ async function main() {
   // POST-ACTION: Verify after email
   log('POST-ACTION', 'Verifying after email entry...');
   const emailTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${emailTexts.slice(0, 8).join(' | ')}`);
+  log('POST-ACTION', `Screen shows: ${emailTexts.slice(0, 10).join(' | ')}`);
 
   // 7. Click Login/Register
   log('STEP 7', 'Clicking Login/Register...');
@@ -303,7 +309,7 @@ async function main() {
   // POST-ACTION: Verify after Login/Register
   log('POST-ACTION', 'Verifying after Login/Register click...');
   const lrTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${lrTexts.slice(0, 8).join(' | ')}`);
+  log('POST-ACTION', `Screen shows: ${lrTexts.slice(0, 10).join(' | ')}`);
   const lrCheck = await verifyScreen(['Please enter your password', 'Password', 'Login'], 5000);
   log('POST-ACTION', lrCheck.success ? `✓ Now on: "${lrCheck.found}"` : '⚠ State unclear');
 
@@ -322,7 +328,7 @@ async function main() {
   // POST-ACTION: Verify after password
   log('POST-ACTION', 'Verifying after password entry...');
   const passTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${passTexts.slice(0, 8).join(' | ')}`);
+  log('POST-ACTION', `Screen shows: ${passTexts.slice(0, 10).join(' | ')}`);
 
   // 9. Click Login
   log('STEP 9', 'Clicking Login...');
@@ -333,7 +339,7 @@ async function main() {
   // POST-ACTION: Verify after Login
   log('POST-ACTION', 'Verifying after Login click...');
   const loginTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${loginTexts.slice(0, 8).join(' | ')}`);
+  log('POST-ACTION', `Screen shows: ${loginTexts.slice(0, 10).join(' | ')}`);
   const loginCheck = await verifyScreen(['US', 'EU', 'Asia', 'Dashboard', 'WhatsApp', 'Region'], 8000);
   log('POST-ACTION', loginCheck.success ? `✓ Logged in, seeing: "${loginCheck.found}"` : '⚠ Login state unclear');
 
@@ -346,7 +352,7 @@ async function main() {
   // POST-ACTION: Verify after US
   log('POST-ACTION', 'Verifying after US click...');
   const usTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${usTexts.slice(0, 8).join(' | ')}`);
+  log('POST-ACTION', `Screen shows: ${usTexts.slice(0, 10).join(' | ')}`);
   const usCheck = await verifyScreen(['WhatsApp1', 'WhatsApp', 'Instances', 'Available'], 5000);
   log('POST-ACTION', usCheck.success ? `✓ US selected, seeing: "${usCheck.found}"` : '⚠ US state unclear');
 
@@ -359,7 +365,7 @@ async function main() {
   // POST-ACTION: Verify after WhatsApp1
   log('POST-ACTION', 'Verifying after WhatsApp1 click...');
   const waTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${waTexts.slice(0, 8).join(' | ')}`);
+  log('POST-ACTION', `Screen shows: ${waTexts.slice(0, 10).join(' | ')}`);
   const waCheck = await verifyScreen(['Loading', 'Connecting', 'Launch', 'Open', 'WhatsApp', 'Start'], 5000);
   log('POST-ACTION', waCheck.success ? `✓ WhatsApp1 clicked, seeing: "${waCheck.found}"` : '⚠ WhatsApp1 state unclear');
 
