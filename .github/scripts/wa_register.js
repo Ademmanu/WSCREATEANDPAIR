@@ -149,27 +149,21 @@ async function waitFor(text, timeoutMs = 30000) {
   return { xml: result.xml, element: el };
 }
 
-// ── Permission & Dialog Handling ──────────────────────────────────────────────
+// ── Permission Dialog Handling ──────────────────────────────────────────────
 
-async function dismissChromeDialogs() {
+async function dismissPermissionDialogs() {
   /**
-   * Dismisses Chrome welcome, permission, and notification dialogs
+   * Dismisses Chrome permission dialogs (not welcome/setup screens)
    */
   const dialogs = [
-    { text: 'Use without an account', desc: 'Welcome screen - skip account' },
-    { text: 'Accept & continue', desc: 'Welcome screen - accept terms' },
-    { text: 'Next', desc: 'Welcome screen - next step' },
-    { text: 'No thanks', desc: 'Decline sync/backup' },
-    { text: 'Continue', desc: 'Continue without account' },
     { text: 'While using the app', desc: 'Permission - allow while using' },
     { text: 'Only this time', desc: 'Permission - allow once' },
     { text: 'Allow', desc: 'Permission - allow' },
     { text: 'Don\'t allow', desc: 'Permission - deny' },
-    { text: 'Not now', desc: 'Notification - dismiss' },
   ];
   
   let dismissed = 0;
-  let maxAttempts = 10;
+  let maxAttempts = 5;
   
   while (maxAttempts-- > 0) {
     const xml = await getXML();
@@ -189,30 +183,29 @@ async function dismissChromeDialogs() {
       }
     }
     
-    // Also check for generic permission buttons by position if text fails
+    // Generic fallback for permission dialogs
     if (!found) {
-      // Check if we're still in a dialog state
       const texts = await getVisibleText();
-      const isDialog = texts.some(t => 
-        t.includes('Allow') || 
-        t.includes('permission') || 
-        t.includes('notifications') ||
-        t.includes('audio') ||
-        t.includes('microphone') ||
-        t.includes('camera')
+      const isPermissionDialog = texts.some(t => 
+        t.includes('Allow') && (
+          t.includes('audio') ||
+          t.includes('microphone') ||
+          t.includes('camera') ||
+          t.includes('record') ||
+          t.includes('permission')
+        )
       );
       
-      if (isDialog) {
-        // Try to find any button and tap it (usually "Allow" or "Continue" is on right)
-        log('DIALOG', 'Generic permission detected, tapping right side button');
-        tap(800, 1100); // Right side button approximate
+      if (isPermissionDialog) {
+        log('DIALOG', 'Permission dialog detected, clicking "Allow" area');
+        tap(800, 1100); // Right side where Allow usually is
         await sleep(1500);
         dismissed++;
         found = true;
       }
     }
     
-    if (!found) break; // No more dialogs
+    if (!found) break;
   }
   
   return dismissed;
@@ -268,22 +261,61 @@ async function main() {
   shell('settings put global stay_on_while_plugged_in 3');
   log('STEP 2', '✓ Device awake');
 
-  // 3. Launch Chrome and dismiss all dialogs
+  // 3. Launch Chrome
   log('STEP 3', 'Launching Chrome...');
   shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
-  await sleep(3000);
+  await sleep(4000);
   
-  // Dismiss all Chrome setup dialogs
-  log('STEP 3', 'Dismissing Chrome dialogs...');
-  const dismissed = await dismissChromeDialogs();
-  log('STEP 3', `✓ Dismissed ${dismissed} dialog(s)`);
+  // Handle welcome screen
+  const welcomeCheck = await verifyScreen([
+    'Welcome to Chrome',
+    'Use without an account',
+    'Add account to device',
+    'Search or type URL'
+  ], 8000);
+  
+  if (welcomeCheck.found === 'Welcome to Chrome' || 
+      welcomeCheck.found === 'Use without an account' ||
+      welcomeCheck.found === 'Add account to device') {
+    log('STEP 3', 'Welcome screen detected, skipping...');
+    
+    const noAccount = findElement(welcomeCheck.xml, 'Use without an account');
+    if (noAccount) tap(noAccount.coords.x, noAccount.coords.y);
+    else tap(800, 1700);
+    await sleep(2000);
+    
+    const acceptCheck = await verifyScreen(['Accept & continue', 'Next', 'Continue'], 5000);
+    if (acceptCheck.success) {
+      const btn = findElement(acceptCheck.xml, acceptCheck.found);
+      if (btn) tap(btn.coords.x, btn.coords.y);
+      else tap(800, 1600);
+      await sleep(2000);
+    }
+    
+    const syncCheck = await verifyScreen(['No thanks', 'Not now'], 3000);
+    if (syncCheck.success) {
+      const skipBtn = findElement(syncCheck.xml, syncCheck.found);
+      if (skipBtn) tap(skipBtn.coords.x, skipBtn.coords.y);
+      else tap(250, 1550);
+      await sleep(2000);
+    }
+  }
+  
+  // Handle crash dialog
+  const crashCheck = await verifyScreen(['Close app', 'Search or type URL'], 3000);
+  if (crashCheck.found === 'Close app') {
+    const closeBtn = findElement(crashCheck.xml, 'Close app');
+    if (closeBtn) tap(closeBtn.coords.x, closeBtn.coords.y);
+    await sleep(1000);
+    shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
+    await sleep(3000);
+  }
   
   // POST-ACTION: Verify Chrome ready
   log('POST-ACTION', 'Verifying Chrome is ready...');
   const chromeTexts = await getVisibleText();
   log('POST-ACTION', `Screen shows: ${chromeTexts.slice(0, 8).join(' | ')}`);
   
-  // If still showing new tab page, that's fine
   const chromeReady = await verifyScreen([
     'Search or type URL',
     'Search or type web address',
@@ -308,7 +340,7 @@ async function main() {
   await sleep(6000);
   
   // Dismiss any permission dialogs that appeared after navigation
-  const navDismissed = await dismissChromeDialogs();
+  const navDismissed = await dismissPermissionDialogs();
   if (navDismissed > 0) {
     log('STEP 4', `✓ Dismissed ${navDismissed} permission dialog(s) after navigation`);
   }
@@ -348,7 +380,7 @@ async function main() {
   // 6. Click Login/Register
   log('STEP 6', 'Clicking Login/Register...');
   const loginReg = await waitFor('Login/Register');
-  tap(loginReg.element.coords.x, loginReg.coords.y);
+  tap(loginReg.element.coords.x, loginReg.element.coords.y);
   await sleep(3000);
   
   // POST-ACTION: Verify after Login/Register
