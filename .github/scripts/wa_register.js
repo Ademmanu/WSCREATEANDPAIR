@@ -18,7 +18,7 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const RUN_ID = process.env.GITHUB_RUN_ID;
 
-const TARGET_URL = 'https://cloud.vmoscloud.com/';
+const TARGET_URL = 'https://cloud.vmoscloud.com/login';
 const EMAIL = 'emmanueladeloye2023@gmail.com';
 const PASSWORD = 'Emma2007';
 const SCRIPT_DIR = '/tmp/wa_scripts';
@@ -288,12 +288,25 @@ async function main() {
   // 5. Navigate to URL - Use UIAutomator to find address bar properly
   log('STEP 5', `Navigating to ${TARGET_URL}...`);
   
-  // Try to find address bar by text or content-desc
-  const addressBar = await waitFor('Search or type web address');
-  tap(addressBar.element.coords.x, addressBar.element.coords.y);
-  await sleep(800);
+  // Find and tap address bar by text (avoids microphone icon)
+  try {
+    const addressBar = await waitFor('Search or type web address');
+    tap(addressBar.element.coords.x, addressBar.element.coords.y);
+    log('STEP 5', '✓ Tapped address bar');
+  } catch (e) {
+    // Fallback: try 'Search or type URL' variant
+    try {
+      const addressBar2 = await waitFor('Search or type URL');
+      tap(addressBar2.element.coords.x, addressBar2.element.coords.y);
+      log('STEP 5', '✓ Tapped address bar (URL variant)');
+    } catch (e2) {
+      // Last resort: coordinate tap on left side
+      log('STEP 5', '⚠ Could not find address bar, using coordinate fallback');
+      tap(150, 150);
+    }
+  }
   
-  // Clear and type URL
+  await sleep(800);
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
   keyevent('KEYCODE_DEL');
@@ -312,7 +325,9 @@ async function main() {
     'Login/Register',
     'Email',
     'VMOS',
-    'Cloud'
+    'Cloud',
+    'Password',
+    'Login'
   ], 10000);
   log('POST-ACTION', navCheck.success ? `✓ Page loaded: "${navCheck.found}"` : '⚠ Page may not have loaded');
 
