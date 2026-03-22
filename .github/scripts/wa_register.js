@@ -220,27 +220,55 @@ async function main() {
   shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
   await sleep(4000);
   
-  // POST-ACTION: Show screen FIRST, then handle welcome if needed
+  // POST-ACTION: Show screen FIRST before handling anything
   log('POST-ACTION', 'Verifying Chrome launched...');
   const chromeTexts = await getVisibleText();
   log('POST-ACTION', `Screen shows: ${chromeTexts.slice(0, 10).join(' | ')}`);
   
-  // Check for welcome screen and handle if present
-  const hasWelcome = chromeTexts.some(t => 
-    t.includes('Welcome to Chrome') || 
-    t.includes('Use without an account') ||
-    t.includes('Add account to device')
-  );
+  // Handle welcome screen (precise detection)
+  const welcomeCheck = await verifyScreen([
+    'Welcome to Chrome',
+    'Use without an account',
+    'Add account to device',
+    'Accept & continue',
+    'Terms of Service',
+    'Search or type URL'
+  ], 8000);
   
-  if (hasWelcome) {
-    log('STEP 4', 'First run setup detected, handling...');
-    tap(800, 1700); // "Use without an account" - bottom right
+  if (welcomeCheck.found === 'Welcome to Chrome' || 
+      welcomeCheck.found === 'Use without an account' ||
+      welcomeCheck.found === 'Add account to device') {
+    log('STEP 4', 'Welcome screen detected, skipping setup...');
+    
+    // Click "Use without an account"
+    const noAccount = findElement(welcomeCheck.xml, 'Use without an account');
+    if (noAccount) {
+      tap(noAccount.coords.x, noAccount.coords.y);
+    } else {
+      tap(800, 1700); // Coordinate fallback (bottom right)
+    }
+    log('STEP 4', '✓ Clicked "Use without an account"');
     await sleep(2000);
-    tap(800, 1600); // "Accept & continue" or "Next"
-    await sleep(2000);
-    tap(250, 1550); // "No thanks" for sync (left side)
-    await sleep(2000);
-    log('STEP 4', '✓ Setup completed');
+    
+    // Look for Accept & continue
+    const acceptCheck = await verifyScreen(['Accept & continue', 'Next', 'Continue'], 5000);
+    if (acceptCheck.success) {
+      const btn = findElement(acceptCheck.xml, acceptCheck.found);
+      if (btn) tap(btn.coords.x, btn.coords.y);
+      else tap(800, 1600); // Fallback
+      log('STEP 4', `✓ Clicked "${acceptCheck.found}"`);
+      await sleep(2000);
+    }
+    
+    // Handle "No thanks" for sync
+    const syncCheck = await verifyScreen(['No thanks', 'Not now'], 3000);
+    if (syncCheck.success) {
+      const skipBtn = findElement(syncCheck.xml, syncCheck.found);
+      if (skipBtn) tap(skipBtn.coords.x, skipBtn.coords.y);
+      else tap(250, 1550); // "No thanks" usually on left
+      log('STEP 4', `✓ Clicked "${syncCheck.found}"`);
+      await sleep(2000);
+    }
     
     // Show screen after setup
     const afterSetupTexts = await getVisibleText();
