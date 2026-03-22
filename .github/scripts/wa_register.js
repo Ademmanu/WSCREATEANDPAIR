@@ -285,10 +285,15 @@ async function main() {
   ], 5000);
   log('POST-ACTION', chromeReady.success ? `✓ Chrome ready: "${chromeReady.found}"` : '⚠ Chrome state unclear');
 
-  // 5. Navigate to URL - FIXED: Tap more to the LEFT to avoid microphone
+  // 5. Navigate to URL - Use UIAutomator to find address bar properly
   log('STEP 5', `Navigating to ${TARGET_URL}...`);
-  tap(200, 150); // CHANGED from (400, 150) to (200, 150) - left side of address bar
+  
+  // Try to find address bar by text or content-desc
+  const addressBar = await waitFor('Search or type web address');
+  tap(addressBar.element.coords.x, addressBar.element.coords.y);
   await sleep(800);
+  
+  // Clear and type URL
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
   keyevent('KEYCODE_DEL');
