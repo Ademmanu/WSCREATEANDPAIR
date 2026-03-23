@@ -23,7 +23,7 @@ on:
 jobs:
   register:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -31,12 +31,15 @@ jobs:
 
       - name: Enable KVM
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
 
       - name: Install ADB
-        run: sudo apt-get update -qq && sudo apt-get install -y adb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends adb
 
       - name: Run Automation
         env:
@@ -47,11 +50,13 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 33
-          target: google_apis_playstore
+          api-level: 30
+          target: google_apis
           arch: x86_64
-          profile: pixel_4
-          emulator-options: -no-window -gpu swiftshader -no-snapshot -noaudio -no-boot-anim -memory 4096
+          profile: pixel
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          disable-animations: true
+          emulator-boot-timeout: 900
           script: node .github/scripts/wa_register.js
 
       - name: Upload Screenshots
@@ -61,3 +66,43 @@ jobs:
           name: screenshots-${{ github.run_id }}
           path: /tmp/vmos_*.png
           if-no-files-found: ignore
+
+      - name: Notify bot — failure
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+          PHONE_NUMBER: ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            -d "{
+              \"event\": \"bad_number\",
+              \"phone_number\": \"$PHONE_NUMBER\",
+              \"telegram_user_id\": $TELEGRAM_USER_ID,
+              \"run_id\": \"$GITHUB_RUN_ID\",
+              \"reason\": \"VMOS Cloud automation failed - emulator error\"
+            }"
+
+      - name: Notify bot — cancelled
+        if: cancelled()
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+          PHONE_NUMBER: ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            -d "{
+              \"event\": \"bad_number\",
+              \"phone_number\": \"$PHONE_NUMBER\",
+              \"telegram_user_id\": $TELEGRAM_USER_ID,
+              \"run_id\": \"$GITHUB_RUN_ID\",
+              \"reason\": \"Workflow cancelled\"
+            }"
