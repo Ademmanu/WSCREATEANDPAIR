@@ -115,9 +115,28 @@ async function getVisibleText() {
   const textRe = /text="([^"]*)"/g;
   const descRe = /content-desc="([^"]*)"/g;
   let m;
-  while ((m = textRe.exec(xml)) !== null) if (m[1]) texts.push(m[1]);
-  while ((m = descRe.exec(xml)) !== null) if (m[1]) texts.push(m[1]);
-  return [...new Set(texts)].filter(t => t.length > 0 && !t.includes('AAAAA') && !t.includes('ElFTk'));
+  
+  while ((m = textRe.exec(xml)) !== null) {
+    if (m[1]) texts.push(m[1]);
+  }
+  while ((m = descRe.exec(xml)) !== null) {
+    if (m[1]) texts.push(m[1]);
+  }
+  
+  // Filter out garbage: base64, long random strings, and image data
+  return [...new Set(texts)].filter(t => {
+    // Must be reasonable length (not too short, not too long)
+    if (t.length < 2 || t.length > 100) return false;
+    // Must not be base64-like (long strings with base64 chars only)
+    if (/^[A-Za-z0-9+/=]{20,}$/.test(t)) return false;
+    // Must contain at least one space or be a recognizable word
+    // Or be a common UI label
+    const commonLabels = ['Login', 'Register', 'Email', 'Password', 'Submit', 'Continue', 'Next', 'Back', 'Home', 'Search', 'VMOS', 'Cloud', 'WhatsApp', 'US', 'EU', 'Asia'];
+    const hasCommonWord = commonLabels.some(label => t.toLowerCase().includes(label.toLowerCase()));
+    const hasSpace = t.includes(' ');
+    const isReasonable = /^[A-Za-z0-9\s\-_./@&]+$/.test(t);
+    return (hasSpace || hasCommonWord) && isReasonable;
+  });
 }
 
 async function verifyScreen(expectedTexts, timeoutMs = 10000) {
@@ -321,27 +340,26 @@ async function main() {
   const pageTexts = await getVisibleText();
   log('POST-ACTION', `Screen shows: ${pageTexts.slice(0, 10).join(' | ')}`);
   const navCheck = await verifyScreen([
-    'VMOS Cloud',
+    'Please enter your email address',
     'Login/Register',
-    'User Agreement',
-    'Privacy Policy',
-    'cloud.vmoscloud.com'
+    'Email',
+    'VMOS',
+    'Cloud',
+    'Password',
+    'Login'
   ], 10000);
   log('POST-ACTION', navCheck.success ? `✓ Page loaded: "${navCheck.found}"` : '⚠ Page may not have loaded');
 
-  // 6. Enter Email - Use coordinate tap since placeholder text isn't visible to UIAutomator
+  // 6. Enter Email
   log('STEP 6', 'Entering email...');
-  
-  // Tap on email input field (center of screen, below VMOS Cloud logo)
-  // Based on screenshot: input field is roughly at y=650, full width
-  tap(540, 650); 
+  const emailField = await waitFor('Please enter your email address');
+  tap(emailField.element.coords.x, emailField.element.coords.y);
   await sleep(500);
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
   keyevent('KEYCODE_DEL');
   await sleep(200);
   textInput(EMAIL);
-  log('STEP 6', `✓ Email entered: ${EMAIL}`);
   await sleep(800);
   
   // POST-ACTION: Verify after email
@@ -351,34 +369,27 @@ async function main() {
 
   // 7. Click Login/Register
   log('STEP 7', 'Clicking Login/Register...');
-  try {
-    const loginReg = await waitFor('Login/Register');
-    tap(loginReg.element.coords.x, loginReg.element.coords.y);
-  } catch (e) {
-    // Fallback: blue button is roughly at y=900
-    log('STEP 7', '⚠ Using coordinate fallback for Login/Register');
-    tap(540, 900);
-  }
+  const loginReg = await waitFor('Login/Register');
+  tap(loginReg.element.coords.x, loginReg.element.coords.y);
   await sleep(3000);
   
   // POST-ACTION: Verify after Login/Register
   log('POST-ACTION', 'Verifying after Login/Register click...');
   const lrTexts = await getVisibleText();
   log('POST-ACTION', `Screen shows: ${lrTexts.slice(0, 10).join(' | ')}`);
-  const lrCheck = await verifyScreen(['Please enter your password', 'Password', 'Login', 'VMOS Cloud'], 5000);
+  const lrCheck = await verifyScreen(['Please enter your password', 'Password', 'Login'], 5000);
   log('POST-ACTION', lrCheck.success ? `✓ Now on: "${lrCheck.found}"` : '⚠ State unclear');
 
-  // 8. Enter Password - Use coordinate tap
+  // 8. Enter Password
   log('STEP 8', 'Entering password...');
-  // Password field is below email field, roughly at y=800
-  tap(540, 800);
+  const passField = await waitFor('Please enter your password');
+  tap(passField.element.coords.x, passField.element.coords.y);
   await sleep(500);
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
   keyevent('KEYCODE_DEL');
   await sleep(200);
   textInput(PASSWORD);
-  log('STEP 8', '✓ Password entered');
   await sleep(800);
   
   // POST-ACTION: Verify after password
@@ -388,14 +399,8 @@ async function main() {
 
   // 9. Click Login
   log('STEP 9', 'Clicking Login...');
-  try {
-    const loginBtn = await waitFor('Login');
-    tap(loginBtn.element.coords.x, loginBtn.element.coords.y);
-  } catch (e) {
-    // Fallback: Login button is roughly at y=1000
-    log('STEP 9', '⚠ Using coordinate fallback for Login');
-    tap(540, 1000);
-  }
+  const loginBtn = await waitFor('Login');
+  tap(loginBtn.element.coords.x, loginBtn.element.coords.y);
   await sleep(5000);
   
   // POST-ACTION: Verify after Login
@@ -407,13 +412,8 @@ async function main() {
 
   // 10. Click US
   log('STEP 10', 'Clicking US...');
-  try {
-    const usBtn = await waitFor('US');
-    tap(usBtn.element.coords.x, usBtn.element.coords.y);
-  } catch (e) {
-    // Fallback coordinate
-    tap(200, 600);
-  }
+  const usBtn = await waitFor('US');
+  tap(usBtn.element.coords.x, usBtn.element.coords.y);
   await sleep(3000);
   
   // POST-ACTION: Verify after US
@@ -425,13 +425,8 @@ async function main() {
 
   // 11. Click WhatsApp1
   log('STEP 11', 'Clicking WhatsApp1...');
-  try {
-    const waBtn = await waitFor('WhatsApp1');
-    tap(waBtn.element.coords.x, waBtn.element.coords.y);
-  } catch (e) {
-    // Fallback coordinate
-    tap(540, 800);
-  }
+  const waBtn = await waitFor('WhatsApp1');
+  tap(waBtn.element.coords.x, waBtn.element.coords.y);
   await sleep(2000);
   
   // POST-ACTION: Verify after WhatsApp1
