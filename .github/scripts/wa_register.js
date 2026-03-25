@@ -131,7 +131,7 @@ async function getVisibleText() {
     if (/^[A-Za-z0-9+/=]{20,}$/.test(t)) return false;
     // Must contain at least one space or be a recognizable word
     // Or be a common UI label
-    const commonLabels = ['Login', 'Register', 'Email', 'Password', 'Submit', 'Continue', 'Next', 'Back', 'Home', 'Search', 'VMOS', 'Cloud', 'WhatsApp', 'US', 'EU', 'Asia'];
+    const commonLabels = ['Login', 'Register', 'Email', 'Password', 'Submit', 'Continue', 'Next', 'Back', 'Home', 'Search', 'VMOS', 'Cloud', 'WhatsApp', 'US', 'EU', 'Asia', 'Never', 'Save'];
     const hasCommonWord = commonLabels.some(label => t.toLowerCase().includes(label.toLowerCase()));
     const hasSpace = t.includes(' ');
     const isReasonable = /^[A-Za-z0-9\s\-_./@&]+$/.test(t);
@@ -442,28 +442,50 @@ async function main() {
   tap(loginBtn.element.coords.x, loginBtn.element.coords.y);
   await sleep(5000);
   
-  // POST-ACTION: Verify after Login - SHOW SCREEN AFTER SUCCESSFUL LOGIN
+  // POST-ACTION: Verify after Login
   log('POST-ACTION', 'Verifying after Login click...');
   const loginTexts = await getVisibleText();
   log('POST-ACTION', `Screen shows: ${loginTexts.slice(0, 10).join(' | ')}`);
+
+  // 10. Wait 15 seconds for page to fully load and show save password dialog
+  log('STEP 10', 'Waiting 15 seconds for page to stabilize...');
+  await sleep(15000);
   
-  // Additional verification - wait a bit and show screen again
-  await sleep(3000);
-  const afterLoginTexts = await getVisibleText();
-  log('POST-ACTION', `After 3s delay - Screen shows: ${afterLoginTexts.slice(0, 10).join(' | ')}`);
+  // Check for save password dialog and click "Never"
+  log('STEP 10', 'Checking for save password dialog...');
+  const savePassCheck = await verifyScreen(['Save password?', 'Never', 'Save'], 5000);
+  if (savePassCheck.success) {
+    log('STEP 10', `✓ Found save password dialog: "${savePassCheck.found}"`);
+    try {
+      const neverBtn = await waitFor('Never');
+      tap(neverBtn.element.coords.x, neverBtn.element.coords.y);
+      log('STEP 10', '✓ Clicked "Never" on save password dialog');
+    } catch (e) {
+      // Fallback: tap left side where "Never" usually is
+      log('STEP 10', '⚠ Could not find "Never" button, using coordinate fallback');
+      tap(300, 1650); // Left side of dialog
+    }
+    await sleep(2000);
+  } else {
+    log('STEP 10', '⚠ No save password dialog found');
+  }
   
-  const loginCheck = await verifyScreen(['US', 'EU', 'Asia', 'Dashboard', 'WhatsApp', 'Region', 'Welcome', 'Home', 'Select'], 8000);
-  log('POST-ACTION', loginCheck.success ? `✓ Logged in, seeing: "${loginCheck.found}"` : '⚠ Login state unclear');
+  // Show final screen state
+  const finalTexts = await getVisibleText();
+  log('POST-ACTION', `Final screen shows: ${finalTexts.slice(0, 10).join(' | ')}`);
+  
+  const finalCheck = await verifyScreen(['US', 'EU', 'Asia', 'Dashboard', 'WhatsApp', 'Region', 'Welcome', 'Home', 'Select', 'VMOS'], 5000);
+  log('POST-ACTION', finalCheck.success ? `✓ Final state: "${finalCheck.found}"` : '⚠ Final state unclear');
 
   // STOP HERE - No US or WhatsApp1 clicks
-  log('COMPLETE', 'Stopped after login to verify screen state');
+  log('COMPLETE', 'Stopped after handling save password dialog');
   
   // Take final screenshot
   shell('screencap -p /sdcard/final.png');
   adb('pull /sdcard/final.png /tmp/vmos_final.png');
   log('DEBUG', 'Screenshot saved to /tmp/vmos_final.png');
   
-  await webhook('vmos_stopped', { step: 'after_login', screen: afterLoginTexts.slice(0, 5).join(' | ') });
+  await webhook('vmos_stopped', { step: 'after_login_never_clicked', screen: finalTexts.slice(0, 5).join(' | ') });
 }
 
 main().catch(async (err) => {
