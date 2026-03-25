@@ -469,10 +469,6 @@ async function main() {
   } else {
     log('STEP 10', '⚠ No save password dialog found');
   }
-  
-  // Show screen after step 10
-  const step10Texts = await getVisibleText();
-  log('STEP 10', `Screen show: ${step10Texts.slice(0, 10).join(' | ')}`);
 
   // STEP 11: Close advertisement popup by clicking X button
   log('STEP 11', 'Closing advertisement popup...');
