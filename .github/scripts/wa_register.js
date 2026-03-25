@@ -350,10 +350,30 @@ async function main() {
   ], 10000);
   log('POST-ACTION', navCheck.success ? `✓ Page loaded: "${navCheck.found}"` : '⚠ Page may not have loaded');
 
-  // 6. Enter Email
+  // 6. Enter Email - Find Login/Register button and tap above it where email field is
   log('STEP 6', 'Entering email...');
-  const emailField = await waitFor('Please enter your email address');
-  tap(emailField.element.coords.x, emailField.element.coords.y);
+  try {
+    // Try to find by text first
+    const emailField = await waitFor('Please enter your email address');
+    tap(emailField.element.coords.x, emailField.element.coords.y);
+    log('STEP 6', '✓ Found email field by text');
+  } catch (e) {
+    // Fallback: find Login/Register button and tap above it where email field is
+    log('STEP 6', '⚠ Email field text not found, finding relative to Login/Register');
+    try {
+      const loginRegBtn = await waitFor('Login/Register');
+      // Email field is above the Login/Register button (approximately 200px)
+      const tapX = loginRegBtn.element.coords.x;
+      const tapY = loginRegBtn.element.coords.y - 200;
+      tap(tapX, tapY);
+      log('STEP 6', `✓ Tapped at (${tapX}, ${tapY}) above Login/Register`);
+    } catch (e2) {
+      // Last resort: fixed coordinate
+      log('STEP 6', '⚠ Using fixed coordinate fallback');
+      tap(540, 550); // Above center where email field should be
+    }
+  }
+  
   await sleep(500);
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
@@ -380,10 +400,29 @@ async function main() {
   const lrCheck = await verifyScreen(['Please enter your password', 'Password', 'Login'], 5000);
   log('POST-ACTION', lrCheck.success ? `✓ Now on: "${lrCheck.found}"` : '⚠ State unclear');
 
-  // 8. Enter Password
+  // 8. Enter Password - Find Login button and tap above it where password field is
   log('STEP 8', 'Entering password...');
-  const passField = await waitFor('Please enter your password');
-  tap(passField.element.coords.x, passField.element.coords.y);
+  try {
+    const passField = await waitFor('Please enter your password');
+    tap(passField.element.coords.x, passField.element.coords.y);
+    log('STEP 8', '✓ Found password field by text');
+  } catch (e) {
+    // Fallback: find Login button and tap above it where password field is
+    log('STEP 8', '⚠ Password field text not found, finding relative to Login');
+    try {
+      const loginBtn = await waitFor('Login');
+      // Password field is above the Login button (approximately 200px)
+      const tapX = loginBtn.element.coords.x;
+      const tapY = loginBtn.element.coords.y - 200;
+      tap(tapX, tapY);
+      log('STEP 8', `✓ Tapped at (${tapX}, ${tapY}) above Login`);
+    } catch (e2) {
+      // Last resort: fixed coordinate
+      log('STEP 8', '⚠ Using fixed coordinate fallback');
+      tap(540, 550);
+    }
+  }
+  
   await sleep(500);
   keyevent('KEYCODE_CTRL_A');
   await sleep(200);
