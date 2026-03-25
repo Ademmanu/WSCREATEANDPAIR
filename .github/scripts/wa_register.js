@@ -131,7 +131,7 @@ async function getVisibleText() {
     if (/^[A-Za-z0-9+/=]{20,}$/.test(t)) return false;
     // Must contain at least one space or be a recognizable word
     // Or be a common UI label
-    const commonLabels = ['Login', 'Register', 'Email', 'Password', 'Submit', 'Continue', 'Next', 'Back', 'Home', 'Search', 'VMOS', 'Cloud', 'WhatsApp', 'US', 'EU', 'Asia', 'Never', 'Save'];
+    const commonLabels = ['Login', 'Register', 'Email', 'Password', 'Submit', 'Continue', 'Next', 'Back', 'Home', 'Search', 'VMOS', 'Cloud', 'WhatsApp', 'US', 'EU', 'Asia', 'Never', 'Save', 'Chrome', 'Starting', 'Agree', 'Phone number'];
     const hasCommonWord = commonLabels.some(label => t.toLowerCase().includes(label.toLowerCase()));
     const hasSpace = t.includes(' ');
     const isReasonable = /^[A-Za-z0-9\s\-_./@&]+$/.test(t);
@@ -474,32 +474,69 @@ async function main() {
   log('STEP 11', 'Closing advertisement popup...');
   await sleep(3000); // Wait for popup to fully appear
   
-  // X button coordinates - centered horizontally, at bottom of popup
-  // Based on screenshot analysis: X is at center, below "Buy Now" button
-  const xButtonX = 540;  // Center of 1080px width screen
-  const xButtonY = 1620; // Bottom area of popup
+  // X button at bottom center of popup - y=1620 as specified
+  const xButtonX = 540;
+  const xButtonY = 1620;
   
   log('STEP 11', `Clicking X button at (${xButtonX}, ${xButtonY})`);
   tap(xButtonX, xButtonY);
-  await sleep(1500);
-  log('STEP 11', '✓ Attempted to close advertisement popup');
-  
-  // Show final screen state
-  const finalTexts = await getVisibleText();
-  log('POST-ACTION', `Final screen shows: ${finalTexts.slice(0, 10).join(' | ')}`);
-  
-  const finalCheck = await verifyScreen(['US', 'EU', 'Asia', 'Dashboard', 'WhatsApp', 'Region', 'Welcome', 'Home', 'Select', 'VMOS'], 5000);
-  log('POST-ACTION', finalCheck.success ? `✓ Final state: "${finalCheck.found}"` : '⚠ Final state unclear');
+  await sleep(2000);
+  log('STEP 11', '✓ Closed advertisement popup');
 
-  // STOP HERE - No US or WhatsApp1 clicks
-  log('COMPLETE', 'Stopped after handling save password dialog');
+  // STEP 12: Start Cloud Phone
+  log('STEP 12', 'Starting Cloud Phone...');
+  await sleep(1000);
+  tap(300, 1300);
+  await sleep(5000); // Wait 5 seconds for Cloud Phone to start
+  
+  // Verify Cloud Phone started by checking for Chrome or WhatsApp
+  log('POST-ACTION', 'Verifying Cloud Phone started...');
+  const cloudPhoneCheck = await verifyScreen(['Chrome', 'WhatsApp'], 10000);
+  if (cloudPhoneCheck.success) {
+    log('POST-ACTION', `✓ Cloud Phone started, found: "${cloudPhoneCheck.found}"`);
+  } else {
+    log('POST-ACTION', '⚠ Cloud Phone may not have started properly');
+  }
+  log('STEP 12', '✓ Cloud Phone started');
+
+  // STEP 13: Find and open WhatsApp1
+  log('STEP 13', 'Finding and opening WhatsApp1...');
+  const whatsapp1 = await waitFor('WhatsApp1');
+  tap(whatsapp1.element.coords.x, whatsapp1.element.coords.y);
+  await sleep(2000);
+  log('STEP 13', '✓ Opened WhatsApp1');
+
+  // STEP 14: Find and click "Agree and continue"
+  log('STEP 14', 'Clicking Agree and continue...');
+  const agreeBtn = await waitFor('Agree and continue');
+  tap(agreeBtn.element.coords.x, agreeBtn.element.coords.y);
+  await sleep(1500);
+  log('STEP 14', '✓ Clicked Agree and continue');
+
+  // STEP 15: Find "Phone number" and click above it to search country code
+  log('STEP 15', 'Finding Phone number field...');
+  try {
+    const phoneField = await waitFor('Phone number');
+    // Click above the Phone number field to access country code search
+    const tapX = phoneField.element.coords.x;
+    const tapY = phoneField.element.coords.y - 150; // 150px above phone field
+    tap(tapX, tapY);
+    log('STEP 15', `✓ Clicked at (${tapX}, ${tapY}) above Phone number for country code`);
+  } catch (e) {
+    log('STEP 15', '⚠ Could not find Phone number field');
+    throw e;
+  }
+  await sleep(1000);
+
+  // STOP HERE as requested
+  log('COMPLETE', 'Stopped after clicking country code search');
   
   // Take final screenshot
   shell('screencap -p /sdcard/final.png');
   adb('pull /sdcard/final.png /tmp/vmos_final.png');
   log('DEBUG', 'Screenshot saved to /tmp/vmos_final.png');
   
-  await webhook('vmos_stopped', { step: 'after_login_never_clicked', screen: finalTexts.slice(0, 5).join(' | ') });
+  await webhook('vmos_stopped', { step: 'after_country_code_click', screen: 'Stopped at country code selection' });
 }
 
 main().catch(async (err) => {
