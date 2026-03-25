@@ -469,6 +469,10 @@ async function main() {
   } else {
     log('STEP 10', '⚠ No save password dialog found');
   }
+  
+  // Show screen after step 10
+  const step10Texts = await getVisibleText();
+  log('STEP 10', `Screen show: ${step10Texts.slice(0, 10).join(' | ')}`);
 
   // STEP 11: Close advertisement popup by clicking X button
   log('STEP 11', 'Closing advertisement popup...');
@@ -482,22 +486,30 @@ async function main() {
   tap(xButtonX, xButtonY);
   await sleep(2000);
   log('STEP 11', '✓ Closed advertisement popup');
+  
+  // Show screen after step 11
+  const step11Texts = await getVisibleText();
+  log('STEP 11', `Screen show: ${step11Texts.slice(0, 10).join(' | ')}`);
 
   // STEP 12: Start Cloud Phone
   log('STEP 12', 'Starting Cloud Phone...');
   await sleep(1000);
   tap(300, 1300);
-  await sleep(5000); // Wait 5 seconds for Cloud Phone to start
-  
+  await sleep(40000); // Wait 40 seconds for Cloud Phone to start
+
   // Verify Cloud Phone started by checking for Chrome or WhatsApp
   log('POST-ACTION', 'Verifying Cloud Phone started...');
-  const cloudPhoneCheck = await verifyScreen(['Chrome', 'WhatsApp'], 10000);
+  const cloudPhoneCheck = await verifyScreen(['System Tools', 'WhatsApp'], 10000);
   if (cloudPhoneCheck.success) {
     log('POST-ACTION', `✓ Cloud Phone started, found: "${cloudPhoneCheck.found}"`);
   } else {
     log('POST-ACTION', '⚠ Cloud Phone may not have started properly');
   }
   log('STEP 12', '✓ Cloud Phone started');
+  
+  // Show screen after step 12
+  const step12Texts = await getVisibleText();
+  log('STEP 12', `Screen show: ${step12Texts.slice(0, 10).join(' | ')}`);
 
   // STEP 13: Find and open WhatsApp1
   log('STEP 13', 'Finding and opening WhatsApp1...');
@@ -505,6 +517,10 @@ async function main() {
   tap(whatsapp1.element.coords.x, whatsapp1.element.coords.y);
   await sleep(2000);
   log('STEP 13', '✓ Opened WhatsApp1');
+  
+  // Show screen after step 13
+  const step13Texts = await getVisibleText();
+  log('STEP 13', `Screen show: ${step13Texts.slice(0, 10).join(' | ')}`);
 
   // STEP 14: Find and click "Agree and continue"
   log('STEP 14', 'Clicking Agree and continue...');
@@ -512,6 +528,10 @@ async function main() {
   tap(agreeBtn.element.coords.x, agreeBtn.element.coords.y);
   await sleep(1500);
   log('STEP 14', '✓ Clicked Agree and continue');
+  
+  // Show screen after clicking Agree and continue
+  const step14Texts = await getVisibleText();
+  log('STEP 14', `Screen show: ${step14Texts.slice(0, 10).join(' | ')}`);
 
   // STEP 15: Find "Phone number" and click above it to search country code
   log('STEP 15', 'Finding Phone number field...');
@@ -527,6 +547,10 @@ async function main() {
     throw e;
   }
   await sleep(1000);
+  
+  // Show screen after clicking above Phone number
+  const step15Texts = await getVisibleText();
+  log('STEP 15', `Screen show: ${step15Texts.slice(0, 10).join(' | ')}`);
 
   // STOP HERE as requested
   log('COMPLETE', 'Stopped after clicking country code search');
