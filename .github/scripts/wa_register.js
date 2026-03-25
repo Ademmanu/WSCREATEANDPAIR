@@ -469,6 +469,24 @@ async function main() {
   } else {
     log('STEP 10', '⚠ No save password dialog found');
   }
+
+  // STEP 11: Close advertisement popup by clicking X button
+  log('STEP 11', 'Closing advertisement popup...');
+  await sleep(3000); // Wait for popup to fully appear
+  
+  // X button coordinates - centered horizontally, at bottom of popup
+  // Based on screenshot analysis: X is at center, below "Buy Now" button
+  const xButtonX = 540;  // Center of 1080px width screen
+  const xButtonY = 1300; // Bottom area of popup (adjust if needed: try 1250, 1350, or 1400)
+  
+  log('STEP 11', `Clicking X button at (${xButtonX}, ${xButtonY}) - attempt 1`);
+  tap(xButtonX, xButtonY);
+  await sleep(1500);
+  
+  log('STEP 11', `Clicking X button at (${xButtonX}, ${xButtonY}) - attempt 2`);
+  tap(xButtonX, xButtonY);
+  await sleep(2000);
+  log('STEP 11', '✓ Attempted to close advertisement popup');
   
   // Show final screen state
   const finalTexts = await getVisibleText();
