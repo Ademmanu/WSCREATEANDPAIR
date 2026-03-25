@@ -477,15 +477,11 @@ async function main() {
   // X button coordinates - centered horizontally, at bottom of popup
   // Based on screenshot analysis: X is at center, below "Buy Now" button
   const xButtonX = 540;  // Center of 1080px width screen
-  const xButtonY = 1300; // Bottom area of popup (adjust if needed: try 1250, 1350, or 1400)
+  const xButtonY = 1620; // Bottom area of popup
   
-  log('STEP 11', `Clicking X button at (${xButtonX}, ${xButtonY}) - attempt 1`);
+  log('STEP 11', `Clicking X button at (${xButtonX}, ${xButtonY})`);
   tap(xButtonX, xButtonY);
   await sleep(1500);
-  
-  log('STEP 11', `Clicking X button at (${xButtonX}, ${xButtonY}) - attempt 2`);
-  tap(xButtonX, xButtonY);
-  await sleep(2000);
   log('STEP 11', '✓ Attempted to close advertisement popup');
   
   // Show final screen state
