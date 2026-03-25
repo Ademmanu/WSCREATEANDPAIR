@@ -442,47 +442,28 @@ async function main() {
   tap(loginBtn.element.coords.x, loginBtn.element.coords.y);
   await sleep(5000);
   
-  // POST-ACTION: Verify after Login
+  // POST-ACTION: Verify after Login - SHOW SCREEN AFTER SUCCESSFUL LOGIN
   log('POST-ACTION', 'Verifying after Login click...');
   const loginTexts = await getVisibleText();
   log('POST-ACTION', `Screen shows: ${loginTexts.slice(0, 10).join(' | ')}`);
-  const loginCheck = await verifyScreen(['US', 'EU', 'Asia', 'Dashboard', 'WhatsApp', 'Region'], 8000);
+  
+  // Additional verification - wait a bit and show screen again
+  await sleep(3000);
+  const afterLoginTexts = await getVisibleText();
+  log('POST-ACTION', `After 3s delay - Screen shows: ${afterLoginTexts.slice(0, 10).join(' | ')}`);
+  
+  const loginCheck = await verifyScreen(['US', 'EU', 'Asia', 'Dashboard', 'WhatsApp', 'Region', 'Welcome', 'Home', 'Select'], 8000);
   log('POST-ACTION', loginCheck.success ? `✓ Logged in, seeing: "${loginCheck.found}"` : '⚠ Login state unclear');
 
-  // 10. Click US
-  log('STEP 10', 'Clicking US...');
-  const usBtn = await waitFor('US');
-  tap(usBtn.element.coords.x, usBtn.element.coords.y);
-  await sleep(3000);
+  // STOP HERE - No US or WhatsApp1 clicks
+  log('COMPLETE', 'Stopped after login to verify screen state');
   
-  // POST-ACTION: Verify after US
-  log('POST-ACTION', 'Verifying after US click...');
-  const usTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${usTexts.slice(0, 10).join(' | ')}`);
-  const usCheck = await verifyScreen(['WhatsApp1', 'WhatsApp', 'Instances', 'Available'], 5000);
-  log('POST-ACTION', usCheck.success ? `✓ US selected, seeing: "${usCheck.found}"` : '⚠ US state unclear');
-
-  // 11. Click WhatsApp1
-  log('STEP 11', 'Clicking WhatsApp1...');
-  const waBtn = await waitFor('WhatsApp1');
-  tap(waBtn.element.coords.x, waBtn.element.coords.y);
-  await sleep(2000);
-  
-  // POST-ACTION: Verify after WhatsApp1
-  log('POST-ACTION', 'Verifying after WhatsApp1 click...');
-  const waTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${waTexts.slice(0, 10).join(' | ')}`);
-  const waCheck = await verifyScreen(['Loading', 'Connecting', 'Launch', 'Open', 'WhatsApp', 'Start'], 5000);
-  log('POST-ACTION', waCheck.success ? `✓ WhatsApp1 clicked, seeing: "${waCheck.found}"` : '⚠ WhatsApp1 state unclear');
-
-  // Complete
-  log('COMPLETE', 'Stopped at WhatsApp1 as requested');
-  
+  // Take final screenshot
   shell('screencap -p /sdcard/final.png');
   adb('pull /sdcard/final.png /tmp/vmos_final.png');
-  log('DEBUG', 'Screenshot saved');
+  log('DEBUG', 'Screenshot saved to /tmp/vmos_final.png');
   
-  await webhook('vmos_stopped', { step: 'whatsapp1_selected' });
+  await webhook('vmos_stopped', { step: 'after_login', screen: afterLoginTexts.slice(0, 5).join(' | ') });
 }
 
 main().catch(async (err) => {
