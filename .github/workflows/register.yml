@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       phone_number:
-        description: 'Phone number'
+        description: 'Phone number (with country code, e.g. 2348012345678)'
         required: true
         type: string
       telegram_user_id:
@@ -23,7 +23,7 @@ on:
 jobs:
   register:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -41,40 +41,64 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends adb
 
-      - name: Run WhatsApp Automation
+      - name: Download WhatsApp APK from GitHub Release
+        run: |
+          # Download WhatsApp Business or standard WhatsApp from your repo's releases
+          # Replace with your actual release URL or use a specific version
+          WHATSAPP_URL="https://github.com/${{ github.repository }}/releases/download/whatsapp-v2.24.20/whatsapp.apk"
+          
+          echo "Downloading WhatsApp APK..."
+          curl -L -o /tmp/whatsapp.apk "$WHATSAPP_URL" || {
+            echo "Failed to download from release, trying alternative..."
+            # Fallback: Download from official source (requires authentication)
+            # Or use a pre-uploaded artifact approach
+            exit 1
+          }
+          
+          ls -la /tmp/whatsapp.apk
+          echo "APK downloaded successfully"
+
+      - name: Run WhatsApp Registration Automation
         env:
           PHONE_NUMBER: ${{ inputs.phone_number }}
           TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
           WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
           WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPO: Ademmanu/WSCREATEANDPAIR
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 30
           target: google_apis
           arch: x86_64
-          profile: pixel
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          profile: pixel_4
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -memory 4096
           disable-animations: true
           emulator-boot-timeout: 900
-          script: node .github/scripts/wa_register.js
+          script: |
+            # Install WhatsApp APK
+            echo "[SETUP] Installing WhatsApp APK..."
+            adb install -r /tmp/whatsapp.apk
+            
+            # Wait for installation
+            sleep 3
+            
+            # Run the registration script
+            node .github/scripts/wa_register.js
 
-      - name: Upload All Screenshots
+      - name: Upload Screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots-${{ github.run_id }}
-          path: /tmp/wa_screenshot_*.png
+          name: screenshots-${{ github.run_id }}-${{ inputs.phone_number }}
+          path: /tmp/wa_screenshots/
           if-no-files-found: ignore
 
-      - name: Upload Error Screenshot
-        if: failure()
+      - name: Upload Session Data
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: error-screenshot-${{ github.run_id }}
-          path: /tmp/wa_error.png
+          name: session-${{ github.run_id }}-${{ inputs.phone_number }}
+          path: /tmp/wa_session.json
           if-no-files-found: ignore
 
       - name: Notify bot — failure
@@ -92,7 +116,7 @@ jobs:
             -d "{
               \"event\": \"bad_number\",
               \"phone_number\": \"$PHONE_NUMBER\",
-              \"telegram_user_id\": $TELEGRAM_USER_ID,
+              \"telegram_user_id\": $TELEGRAM_ID,
               \"run_id\": \"$GITHUB_RUN_ID\",
               \"reason\": \"WhatsApp registration automation failed\"
             }"
