@@ -312,21 +312,218 @@ async function main() {
     log('POST-ACTION', `✓ Now on: "${phoneCheck.found}"`);
   }
 
-  // STOP HERE as requested - after Agree and continue
-  log('COMPLETE', 'Stopped after "Agree and continue" as requested');
+  // 6. Handle potential permission dialogs
+  log('STEP 6', 'Checking for permission dialogs...');
+  await sleep(1000);
+  
+  // Check for SMS permission dialog
+  const smsPermCheck = await verifyScreen(['Allow WhatsApp to send and view SMS messages', 'Allow'], 3000);
+  if (smsPermCheck.success) {
+    log('STEP 6', 'Found SMS permission dialog, clicking Allow...');
+    const allowBtn = findElement(smsPermCheck.xml, 'Allow');
+    if (allowBtn) {
+      tap(allowBtn.coords.x, allowBtn.coords.y);
+      await sleep(1500);
+      takeScreenshot('06_sms_permission_allowed');
+      log('POST-ACTION', '✓ SMS permission granted');
+    }
+  } else {
+    log('STEP 6', 'No SMS permission dialog found, continuing...');
+  }
+  
+  // 7. Dump UI to detect phone number screen
+  log('STEP 7', 'Dumping UI to detect phone number screen...');
+  await sleep(1000);
+  const phoneScreenXml = await getXML();
+  const phoneScreenTexts = await getVisibleText();
+  log('POST-ACTION', `Phone screen shows: ${phoneScreenTexts.slice(0, 10).join(' | ')}`);
+  takeScreenshot('07_phone_number_screen');
+  
+  // Verify we're on phone number entry screen
+  const phoneNumberCheck = await verifyScreen([
+    'Enter your phone number',
+    'Phone number',
+    'Continue',
+    'Next'
+  ], 8000);
+  
+  if (!phoneNumberCheck.success) {
+    throw new Error('Could not detect phone number entry screen');
+  }
+  log('POST-ACTION', `✓ On phone number screen: "${phoneNumberCheck.found}"`);
+  
+  // 8. Parse phone number (country code + national number)
+  log('STEP 8', 'Parsing phone number...');
+  let countryCode = '';
+  let nationalNumber = '';
+  
+  // Parse phone number - expecting format like +1234567890 or 1234567890
+  const phoneClean = PHONE.replace(/[^0-9+]/g, '');
+  if (phoneClean.startsWith('+')) {
+    // International format: +1 234567890
+    const withoutPlus = phoneClean.substring(1);
+    // Common country codes: +1 (US/CA), +44 (UK), +91 (India), +86 (China), +7 (Russia), +234 (Nigeria), etc.
+    // We'll try to detect based on length - this is a simple heuristic
+    if (withoutPlus.startsWith('1') && withoutPlus.length === 11) {
+      countryCode = '1';
+      nationalNumber = withoutPlus.substring(1);
+    } else if (withoutPlus.startsWith('44') && withoutPlus.length >= 11) {
+      countryCode = '44';
+      nationalNumber = withoutPlus.substring(2);
+    } else if (withoutPlus.startsWith('91') && withoutPlus.length === 12) {
+      countryCode = '91';
+      nationalNumber = withoutPlus.substring(2);
+    } else if (withoutPlus.startsWith('86') && withoutPlus.length === 13) {
+      countryCode = '86';
+      nationalNumber = withoutPlus.substring(2);
+    } else if (withoutPlus.startsWith('234') && withoutPlus.length === 13) {
+      countryCode = '234';
+      nationalNumber = withoutPlus.substring(3);
+    } else {
+      // Fallback: assume first 1-3 digits are country code
+      const match = withoutPlus.match(/^(\d{1,3})(\d+)$/);
+      if (match) {
+        countryCode = match[1];
+        nationalNumber = match[2];
+      } else {
+        throw new Error(`Could not parse phone number: ${PHONE}`);
+      }
+    }
+  } else {
+    // Assume it's just national number without country code (default to US +1)
+    countryCode = '1';
+    nationalNumber = phoneClean;
+  }
+  
+  log('STEP 8', `Parsed: Country Code = ${countryCode}, National Number = ${nationalNumber}`);
+  
+  // 9. Edit country code
+  log('STEP 9', 'Editing country code...');
+  await sleep(500);
+  
+  // Find country code selector (usually shows something like "United States +1" or just the flag/code)
+  const countrySelector = findElement(phoneScreenXml, countryCode) || 
+                          findElement(phoneScreenXml, 'Country') ||
+                          findElement(phoneScreenXml, 'Select');
+  
+  if (countrySelector) {
+    log('STEP 9', `Found country selector, tapping...`);
+    tap(countrySelector.coords.x, countrySelector.coords.y);
+    await sleep(2000);
+    takeScreenshot('08_country_selector_opened');
+    
+    // Try to find the search box or type country code directly
+    const searchCheck = await verifyScreen(['Search', 'Type to search'], 3000);
+    if (searchCheck.success) {
+      const searchBox = findElement(searchCheck.xml, 'Search') || findElement(searchCheck.xml, 'Type');
+      if (searchBox) {
+        tap(searchBox.coords.x, searchBox.coords.y);
+        await sleep(500);
+        textInput(countryCode);
+        await sleep(1000);
+        takeScreenshot('09_country_code_typed');
+        
+        // Select first result
+        keyevent('KEYCODE_DPAD_DOWN');
+        await sleep(300);
+        keyevent('KEYCODE_ENTER');
+        await sleep(1000);
+        takeScreenshot('10_country_selected');
+        log('POST-ACTION', `✓ Country code ${countryCode} selected`);
+      }
+    }
+  } else {
+    log('STEP 9', 'Country code field not found or already set correctly');
+  }
+  
+  // 10. Enter national number
+  log('STEP 10', 'Entering national phone number...');
+  await sleep(1000);
+  
+  // Dump UI again to find phone number input field
+  const phoneInputXml = await getXML();
+  
+  // Find the phone number input field (usually has hint like "Phone number" or is an EditText)
+  // Look for EditText elements or input fields
+  const inputFieldRe = /<node[^>]*class="android\.widget\.EditText"[^>]*bounds="([^"]+)"[^>]*>/g;
+  let inputMatch;
+  const inputFields = [];
+  
+  while ((inputMatch = inputFieldRe.exec(phoneInputXml)) !== null) {
+    const bounds = inputMatch[1];
+    const coords = parseBounds(bounds);
+    if (coords) inputFields.push(coords);
+  }
+  
+  if (inputFields.length > 0) {
+    // Usually the phone number field is the main/largest EditText on screen
+    // Tap on the first or largest one
+    const phoneField = inputFields[0];
+    log('STEP 10', `Found phone input field at (${phoneField.x}, ${phoneField.y})`);
+    tap(phoneField.x, phoneField.y);
+    await sleep(1000);
+    
+    // Enter the national number
+    textInput(nationalNumber);
+    await sleep(1500);
+    takeScreenshot('11_phone_number_entered');
+    log('POST-ACTION', `✓ Phone number entered: ${nationalNumber}`);
+  } else {
+    throw new Error('Could not find phone number input field');
+  }
+  
+  // 11. Tap NEXT button
+  log('STEP 11', 'Tapping NEXT button...');
+  await sleep(500);
+  
+  const nextBtnXml = await getXML();
+  const nextBtn = findElement(nextBtnXml, 'Next') || findElement(nextBtnXml, 'Continue');
+  
+  if (!nextBtn) {
+    throw new Error('Could not find NEXT/Continue button');
+  }
+  
+  log('STEP 11', `Found NEXT button at (${nextBtn.coords.x}, ${nextBtn.coords.y})`);
+  tap(nextBtn.coords.x, nextBtn.coords.y);
+  await sleep(2000);
+  takeScreenshot('12_next_clicked');
+  
+  // POST-ACTION: Verify what screen we're on after clicking NEXT
+  const afterNextTexts = await getVisibleText();
+  log('POST-ACTION', `After NEXT - Screen shows: ${afterNextTexts.slice(0, 10).join(' | ')}`);
+  
+  // Check if we're on verification code screen
+  const verifyCheck = await verifyScreen([
+    'Enter your verification code',
+    'Verify',
+    'Code',
+    'We sent an SMS',
+    'SMS',
+    'Didn\'t get',
+    'Call me',
+    '6-digit code'
+  ], 5000);
+  
+  if (verifyCheck.success) {
+    log('POST-ACTION', `✓ Now on verification screen: "${verifyCheck.found}"`);
+    takeScreenshot('13_verification_screen');
+  }
+  
+  // STOP HERE as requested - after NEXT is clicked
+  log('COMPLETE', 'Stopped after phone number entry and NEXT click as requested');
   
   // Final screenshot
   await sleep(1000);
-  takeScreenshot('99_final_stopped');
+  takeScreenshot('99_final_stopped_at_verification');
   
-  // Send webhook indicating we're ready for phone number entry
-  await webhook('whatsapp_ready', { 
-    step: 'after_agree_continue',
-    screen: 'Phone number entry ready',
-    message: 'WhatsApp launched and terms accepted. Ready for phone number entry.'
+  // Send webhook indicating we're waiting for OTP
+  await webhook('awaiting_otp', { 
+    phone_number: PHONE,
+    step: 'verification_screen',
+    message: 'Phone number entered, waiting for verification code'
   });
   
-  log('COMPLETE', 'WhatsApp is ready for phone number registration');
+  log('COMPLETE', 'WhatsApp is ready for OTP verification');
 }
 
 main().catch(async (err) => {
