@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       phone_number:
-        description: 'Phone number (with country code, e.g. 2348012345678)'
+        description: 'Phone number'
         required: true
         type: string
       telegram_user_id:
@@ -23,7 +23,7 @@ on:
 jobs:
   register:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -43,22 +43,24 @@ jobs:
 
       - name: Download WhatsApp APK from GitHub Release
         run: |
-          # Download WhatsApp Business or standard WhatsApp from your repo's releases
-          # Replace with your actual release URL or use a specific version
-          WHATSAPP_URL="https://github.com/${{ github.repository }}/releases/download/whatsapp-v2.24.20/whatsapp.apk"
+          # Download WhatsApp APK from your repository's releases
+          # Replace 'YOUR_REPO' with your actual repo and adjust version/tag as needed
+          WHATSAPP_URL="https://github.com/YOUR_OWNER/YOUR_REPO/releases/download/whatsapp-v2.24.20/whatsapp.apk"
+          
+          # Alternative: Download from official source or use a direct link
+          # WHATSAPP_URL="https://scontent.whatsapp.net/v/t61.24694-34/..."
           
           echo "Downloading WhatsApp APK..."
           curl -L -o /tmp/whatsapp.apk "$WHATSAPP_URL" || {
             echo "Failed to download from release, trying alternative..."
-            # Fallback: Download from official source (requires authentication)
-            # Or use a pre-uploaded artifact approach
+            # Fallback: Use a direct download link or fail gracefully
             exit 1
           }
           
-          ls -la /tmp/whatsapp.apk
-          echo "APK downloaded successfully"
+          ls -lh /tmp/whatsapp.apk
+          file /tmp/whatsapp.apk
 
-      - name: Run WhatsApp Registration Automation
+      - name: Run Automation
         env:
           PHONE_NUMBER: ${{ inputs.phone_number }}
           TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
@@ -70,17 +72,17 @@ jobs:
           api-level: 30
           target: google_apis
           arch: x86_64
-          profile: pixel_4
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -memory 4096
+          profile: pixel
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
           disable-animations: true
           emulator-boot-timeout: 900
           script: |
             # Install WhatsApp APK
-            echo "[SETUP] Installing WhatsApp APK..."
+            echo "Installing WhatsApp APK..."
             adb install -r /tmp/whatsapp.apk
             
-            # Wait for installation
-            sleep 3
+            # Create screenshots directory
+            mkdir -p /tmp/screenshots
             
             # Run the registration script
             node .github/scripts/wa_register.js
@@ -90,15 +92,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: screenshots-${{ github.run_id }}-${{ inputs.phone_number }}
-          path: /tmp/wa_screenshots/
-          if-no-files-found: ignore
-
-      - name: Upload Session Data
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: session-${{ github.run_id }}-${{ inputs.phone_number }}
-          path: /tmp/wa_session.json
+          path: /tmp/screenshots/*.png
           if-no-files-found: ignore
 
       - name: Notify bot — failure
@@ -116,9 +110,9 @@ jobs:
             -d "{
               \"event\": \"bad_number\",
               \"phone_number\": \"$PHONE_NUMBER\",
-              \"telegram_user_id\": $TELEGRAM_ID,
+              \"telegram_user_id\": $TELEGRAM_USER_ID,
               \"run_id\": \"$GITHUB_RUN_ID\",
-              \"reason\": \"WhatsApp registration automation failed\"
+              \"reason\": \"WhatsApp registration automation failed - emulator error\"
             }"
 
       - name: Notify bot — cancelled
