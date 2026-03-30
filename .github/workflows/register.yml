@@ -95,10 +95,10 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 30
-          target: google_apis
+          api-level: 34
+          target: google_apis_playstore
           arch: x86_64
-          profile: pixel
+          profile: pixel_6
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
           disable-animations: true
           emulator-boot-timeout: 900
