@@ -269,7 +269,28 @@ async function main() {
   log('POST-ACTION', `Screen shows: ${whatsappTexts.slice(0, 10).join(' | ')}`);
   takeScreenshot('04_whatsapp_launched');
   
-  // Verify WhatsApp is on welcome/terms screen
+  // 4a. Check for initial OK/Continue dialogs (permissions, info screens, etc.)
+  log('STEP 4a', 'Checking for initial dialogs (OK, Continue, Allow, etc.)...');
+  await sleep(1000);
+  
+  const initialDialogCheck = await verifyScreen(['OK', 'Continue', 'Allow', 'Got it'], 3000);
+  if (initialDialogCheck.success) {
+    log('STEP 4a', `Found dialog button: "${initialDialogCheck.found}"`);
+    const dialogBtn = findElement(initialDialogCheck.xml, initialDialogCheck.found);
+    if (dialogBtn) {
+      log('STEP 4a', `Clicking "${initialDialogCheck.found}" at (${dialogBtn.coords.x}, ${dialogBtn.coords.y})`);
+      tap(dialogBtn.coords.x, dialogBtn.coords.y);
+      await sleep(2000);
+      takeScreenshot('04a_initial_dialog_clicked');
+      log('POST-ACTION', `✓ Clicked "${initialDialogCheck.found}"`);
+    }
+  } else {
+    log('STEP 4a', 'No initial dialog found, continuing...');
+  }
+  
+  // 4b. Verify WhatsApp is on welcome/terms screen
+  log('STEP 4b', 'Waiting for welcome screen...');
+  await sleep(1000);
   const welcomeCheck = await verifyScreen([
     'Welcome to WhatsApp',
     'Terms of Service',
@@ -281,9 +302,13 @@ async function main() {
   ], 10000);
   
   if (!welcomeCheck.success) {
-    throw new Error('WhatsApp did not launch properly or unexpected screen');
+    // Try to capture what's on screen for debugging
+    const currentTexts = await getVisibleText();
+    log('ERROR', `Welcome screen not found. Current screen shows: ${currentTexts.slice(0, 15).join(' | ')}`);
+    throw new Error('WhatsApp did not reach welcome/terms screen');
   }
   log('POST-ACTION', `✓ WhatsApp ready: "${welcomeCheck.found}"`);
+  takeScreenshot('04b_welcome_screen');
 
   // 5. Click "Agree and continue"
   log('STEP 5', 'Clicking Agree and continue...');
