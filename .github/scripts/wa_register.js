@@ -2,10 +2,8 @@
  * wa_register.js — Direct WhatsApp automation via ADB + UIAutomator
  *
  * Flow:
- *   1. Download WhatsApp APK from GitHub release
- *   2. Install APK on emulator
- *   3. Grant permissions
- *   4. Launch WhatsApp → agree → enter phone → receive OTP → done
+ *   1. Verify WhatsApp is pre-installed (run WhatsApp Install workflow first)
+ *   2. Launch WhatsApp directly → agree → enter phone → receive OTP → done
  *   5. Upload screenshots at every key step
  */
 
@@ -17,6 +15,8 @@ const path = require('path');
 const https = require('https');
 const http  = require('http');
 
+// (https/http used only for webhook)
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 const PHONE          = process.env.PHONE_NUMBER;
@@ -25,13 +25,8 @@ const WEBHOOK_URL    = process.env.WEBHOOK_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const RUN_ID         = process.env.GITHUB_RUN_ID;
 
-// Uses the same repo this workflow runs in (github.repository = "owner/repo").
-// Upload whatsapp.apk as a release asset and the script will find it.
-const GITHUB_REPO  = process.env.GITHUB_REPOSITORY || '';
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const WA_PACKAGE = 'com.whatsapp';
 
-const APK_LOCAL      = '/tmp/whatsapp.apk';
-const WA_PACKAGE     = 'com.whatsapp';
 const SCRIPT_DIR     = '/tmp/wa_scripts';
 const SCREENSHOT_DIR = '/tmp';
 
@@ -202,101 +197,6 @@ async function webhook(event, extra = {}) {
 
 // ── HTTP GET (follows redirects) ──────────────────────────────────────────────
 
-function httpGet(url, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const u   = new URL(url);
-    const lib = u.protocol === 'https:' ? https : http;
-    const opts = {
-      hostname: u.hostname,
-      port: u.port || (u.protocol === 'https:' ? 443 : 80),
-      path: u.pathname + u.search,
-      method: 'GET',
-      headers: { 'User-Agent': 'wa-register/1.0', ...headers },
-    };
-    lib.get(opts, res => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return httpGet(res.headers.location, headers).then(resolve).catch(reject);
-      }
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => resolve({ status: res.statusCode, body: data }));
-    }).on('error', reject);
-  });
-}
-
-// ── Download file to disk (follows redirects) ─────────────────────────────────
-
-function downloadFile(url, dest, headers = {}) {
-  return new Promise((resolve, reject) => {
-    log('DOWNLOAD', `${url} → ${dest}`);
-    const u   = new URL(url);
-    const lib = u.protocol === 'https:' ? https : http;
-    const opts = {
-      hostname: u.hostname,
-      port: u.port || (u.protocol === 'https:' ? 443 : 80),
-      path: u.pathname + u.search,
-      method: 'GET',
-      headers: { 'User-Agent': 'wa-register/1.0', ...headers },
-    };
-    lib.get(opts, res => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return downloadFile(res.headers.location, dest, headers).then(resolve).catch(reject);
-      }
-      if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode} downloading ${url}`));
-      }
-      const out = fs.createWriteStream(dest);
-      res.pipe(out);
-      out.on('finish', () => { out.close(); resolve(dest); });
-      out.on('error', reject);
-    }).on('error', reject);
-  });
-}
-
-// ── APK fetch: direct URL or GitHub releases API ──────────────────────────────
-
-async function fetchApk() {
-  if (!GITHUB_REPO) throw new Error('GITHUB_REPOSITORY is not set');
-
-  const authHeaders = GITHUB_TOKEN
-    ? { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' }
-    : { Accept: 'application/vnd.github+json' };
-
-  log('APK', `Fetching latest release from github.com/${GITHUB_REPO}`);
-  const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
-  const resp = await httpGet(apiUrl, authHeaders);
-  if (resp.status !== 200) throw new Error(`GitHub API ${resp.status}: ${resp.body}`);
-
-  const release = JSON.parse(resp.body);
-  log('APK', `Latest release: ${release.tag_name} — ${release.assets.length} asset(s)`);
-
-  // Look specifically for whatsapp.apk
-  const asset = release.assets.find(a => a.name === 'whatsapp.apk');
-  if (!asset) throw new Error(`No whatsapp.apk found in release ${release.tag_name}`);
-
-  log('APK', `Downloading whatsapp.apk (${Math.round(asset.size / 1024 / 1024)} MB)`);
-  await downloadFile(asset.browser_download_url, APK_LOCAL, authHeaders);
-}
-
-// ── WhatsApp permissions ──────────────────────────────────────────────────────
-
-const WA_PERMISSIONS = [
-  'android.permission.READ_CONTACTS',
-  'android.permission.WRITE_CONTACTS',
-  'android.permission.READ_PHONE_STATE',
-  'android.permission.CALL_PHONE',
-  'android.permission.RECORD_AUDIO',
-  'android.permission.CAMERA',
-  'android.permission.READ_EXTERNAL_STORAGE',
-  'android.permission.WRITE_EXTERNAL_STORAGE',
-  'android.permission.ACCESS_FINE_LOCATION',
-  'android.permission.ACCESS_COARSE_LOCATION',
-  'android.permission.POST_NOTIFICATIONS',
-  'android.permission.RECEIVE_SMS',
-  'android.permission.READ_SMS',
-  'android.permission.SEND_SMS',
-];
-
 // ── OTP polling ───────────────────────────────────────────────────────────────
 // bot.py should write the OTP to /tmp/wa_otp_<phone>.txt when it arrives.
 
@@ -337,32 +237,16 @@ async function main() {
   shell('settings put global transition_animation_scale 0');
   shell('settings put global animator_duration_scale 0');
 
-  // STEP 2 — Download APK
-  log('STEP 2', 'Downloading WhatsApp APK from GitHub release…');
-  await fetchApk();
-  const apkSize = fs.statSync(APK_LOCAL).size;
-  log('STEP 2', `✓ APK ready (${Math.round(apkSize / 1024 / 1024)} MB)`);
-
-  // STEP 3 — Install APK
-  log('STEP 3', 'Installing WhatsApp…');
-  shell(`pm uninstall ${WA_PACKAGE} 2>/dev/null || true`);
-  await sleep(1000);
-  const installOut = adb(`install -r -g "${APK_LOCAL}"`, 120000);
-  log('STEP 3', `Install: ${installOut}`);
-  if (!installOut.toLowerCase().includes('success')) {
-    throw new Error(`APK install failed: ${installOut}`);
+  // STEP 2 — Verify WhatsApp is pre-installed (by WhatsApp Install workflow)
+  log('STEP 2', 'Verifying WhatsApp is pre-installed…');
+  const pkgCheck = shell(`pm list packages | grep ${WA_PACKAGE}`);
+  if (!pkgCheck.includes(WA_PACKAGE)) {
+    throw new Error('WhatsApp is not installed. Run the "WhatsApp Install" workflow first.');
   }
-  log('STEP 3', '✓ WhatsApp installed');
+  log('STEP 2', `✓ Found: ${pkgCheck.trim()}`);
 
-  // STEP 4 — Grant permissions upfront
-  log('STEP 4', 'Granting permissions…');
-  for (const perm of WA_PERMISSIONS) {
-    shell(`pm grant ${WA_PACKAGE} ${perm} 2>/dev/null || true`);
-  }
-  log('STEP 4', '✓ Permissions granted');
-
-  // STEP 5 — Launch WhatsApp
-  log('STEP 5', 'Launching WhatsApp…');
+  // STEP 3 — Launch WhatsApp directly
+  log('STEP 3', 'Launching WhatsApp…');
   shell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1`);
   await sleep(5000);
   await screenshot('launch');
@@ -371,13 +255,13 @@ async function main() {
     ['Agree and continue', 'AGREE AND CONTINUE', 'Continue', 'WhatsApp'],
     20000
   );
-  log('STEP 5', launchCheck.success
+  log('STEP 3', launchCheck.success
     ? `✓ WhatsApp up, found: "${launchCheck.found}"`
     : '⚠ Still loading…'
   );
 
-  // STEP 6 — Agree & continue
-  log('STEP 6', 'Agreeing to terms…');
+  // STEP 4 — Agree & continue
+  log('STEP 4', 'Agreeing to terms…');
   for (const label of ['AGREE AND CONTINUE', 'Agree and continue', 'Continue']) {
     const check = await verifyScreen(label, 3000);
     if (check.success) {
@@ -397,8 +281,8 @@ async function main() {
     await sleep(1000);
   }
 
-  // STEP 7 — Enter phone number
-  log('STEP 7', 'Entering phone number…');
+  // STEP 5 — Enter phone number
+  log('STEP 5', 'Entering phone number…');
   const phoneScreen = await verifyScreen(
     ['Phone number', 'Enter your phone number', 'phone number'],
     15000
@@ -441,8 +325,8 @@ async function main() {
   }
   await screenshot('after_phone_submit');
 
-  // STEP 8 — Wait for OTP screen
-  log('STEP 8', 'Waiting for OTP screen…');
+  // STEP 6 — Wait for OTP screen
+  log('STEP 6', 'Waiting for OTP screen…');
   const otpScreen = await verifyScreen(
     ['Enter the 6-digit code', 'Verification code', 'Enter code', 'digit code'],
     30000
@@ -452,13 +336,13 @@ async function main() {
     throw new Error('OTP screen did not appear');
   }
   await screenshot('otp_screen');
-  log('STEP 8', '✓ OTP screen reached');
+  log('STEP 6', '✓ OTP screen reached');
   await webhook('otp_requested', { step: 'awaiting_otp' });
 
-  // STEP 9 — Enter OTP
-  log('STEP 9', 'Waiting for OTP from bot…');
+  // STEP 7 — Enter OTP
+  log('STEP 7', 'Waiting for OTP from bot…');
   const otp = await waitForOtp(180000);
-  log('STEP 9', `Entering OTP: ${otp}`);
+  log('STEP 7', `Entering OTP: ${otp}`);
 
   try {
     const codeField = await waitFor('Enter the 6-digit code');
@@ -488,8 +372,8 @@ async function main() {
     await sleep(3000);
   }
 
-  // STEP 10 — Post-registration screens
-  log('STEP 10', 'Handling post-registration screens…');
+  // STEP 8 — Post-registration screens
+  log('STEP 8', 'Handling post-registration screens…');
 
   // Notification permission
   const notifDlg = await verifyScreen(['Allow', 'Not now'], 4000);
@@ -505,7 +389,7 @@ async function main() {
     5000
   );
   if (profileScreen.success) {
-    log('STEP 10', 'Profile screen — entering name');
+    log('STEP 8', 'Profile screen — entering name');
     try {
       const nameField = await waitFor('Your name');
       tap(nameField.element.coords.x, nameField.element.coords.y + 50);
@@ -529,8 +413,8 @@ async function main() {
     await sleep(1000);
   }
 
-  // STEP 11 — Confirm ready
-  log('STEP 11', 'Verifying WhatsApp is ready…');
+  // STEP 9 — Confirm ready
+  log('STEP 9', 'Verifying WhatsApp is ready…');
   const ready = await verifyScreen(
     ['Chats', 'New chat', 'CHATS', 'Start chatting'],
     20000
@@ -538,14 +422,14 @@ async function main() {
   await screenshot('whatsapp_ready');
 
   if (!ready.success) {
-    log('STEP 11', '⚠ Could not confirm Chats screen');
+    log('STEP 9', '⚠ Could not confirm Chats screen');
     await webhook('bad_number', { reason: 'Registration did not complete successfully' });
     process.exit(1);
   }
 
-  log('STEP 11', '✓ WhatsApp ready — Chats screen visible');
+  log('STEP 9', '✓ WhatsApp ready — Chats screen visible');
 
-  // STEP 12 — Notify success
+  // STEP 10 — Notify success
   await webhook('registered', { step: 'complete', screen: 'WhatsApp Chats' });
   log('COMPLETE', `✓ Registration complete for ${PHONE}`);
 }
