@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       phone_number:
-        description: 'Phone number'
+        description: 'Phone number (E.164, e.g. +2348012345678)'
         required: true
         type: string
       telegram_user_id:
@@ -23,7 +23,7 @@ on:
 jobs:
   register:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -41,13 +41,15 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends adb
 
-      - name: Run Automation
+      - name: Run WhatsApp Automation
         env:
-          PHONE_NUMBER: ${{ inputs.phone_number }}
-          TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
-          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
-          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
+          PHONE_NUMBER:      ${{ inputs.phone_number }}
+          TELEGRAM_USER_ID:  ${{ inputs.telegram_user_id }}
+          WEBHOOK_URL:       ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET:    ${{ inputs.webhook_secret }}
+          GITHUB_RUN_ID:     ${{ github.run_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 30
@@ -70,11 +72,11 @@ jobs:
       - name: Notify bot — failure
         if: failure()
         env:
-          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
-          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
-          PHONE_NUMBER: ${{ inputs.phone_number }}
+          WEBHOOK_URL:      ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET:   ${{ inputs.webhook_secret }}
+          PHONE_NUMBER:     ${{ inputs.phone_number }}
           TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ID:    ${{ github.run_id }}
         run: |
           curl -s -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
@@ -84,17 +86,17 @@ jobs:
               \"phone_number\": \"$PHONE_NUMBER\",
               \"telegram_user_id\": $TELEGRAM_USER_ID,
               \"run_id\": \"$GITHUB_RUN_ID\",
-              \"reason\": \"VMOS Cloud automation failed - emulator error\"
+              \"reason\": \"WhatsApp automation failed\"
             }"
 
       - name: Notify bot — cancelled
         if: cancelled()
         env:
-          WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
-          WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
-          PHONE_NUMBER: ${{ inputs.phone_number }}
+          WEBHOOK_URL:      ${{ inputs.webhook_url }}/webhook/event
+          WEBHOOK_SECRET:   ${{ inputs.webhook_secret }}
+          PHONE_NUMBER:     ${{ inputs.phone_number }}
           TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ID:    ${{ github.run_id }}
         run: |
           curl -s -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
