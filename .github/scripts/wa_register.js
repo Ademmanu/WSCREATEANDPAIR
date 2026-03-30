@@ -1,27 +1,39 @@
 /**
- * wa_register.js — VMOS Cloud automation via ADB + UIAutomator
+ * wa_register.js — Direct WhatsApp automation via ADB + UIAutomator
+ *
+ * Flow:
+ *   1. Download WhatsApp APK from GitHub release
+ *   2. Install APK on emulator
+ *   3. Grant permissions
+ *   4. Launch WhatsApp → agree → enter phone → receive OTP → done
+ *   5. Upload screenshots at every key step
  */
 
 'use strict';
 
 const { execSync } = require('child_process');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 const https = require('https');
-const http = require('http');
+const http  = require('http');
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-const PHONE = process.env.PHONE_NUMBER;
-const USER_ID = process.env.TELEGRAM_USER_ID;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const PHONE          = process.env.PHONE_NUMBER;
+const USER_ID        = process.env.TELEGRAM_USER_ID;
+const WEBHOOK_URL    = process.env.WEBHOOK_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
-const RUN_ID = process.env.GITHUB_RUN_ID;
+const RUN_ID         = process.env.GITHUB_RUN_ID;
 
-const TARGET_URL = 'https://cloud.vmoscloud.com/login';
-const EMAIL = 'emmanueladeloye2023@gmail.com';
-const PASSWORD = 'Emma2007';
-const SCRIPT_DIR = '/tmp/wa_scripts';
+// Uses the same repo this workflow runs in (github.repository = "owner/repo").
+// Upload whatsapp.apk as a release asset and the script will find it.
+const GITHUB_REPO  = process.env.GITHUB_REPOSITORY || '';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+
+const APK_LOCAL      = '/tmp/whatsapp.apk';
+const WA_PACKAGE     = 'com.whatsapp';
+const SCRIPT_DIR     = '/tmp/wa_scripts';
+const SCREENSHOT_DIR = '/tmp';
 
 // ── Logging & Utilities ───────────────────────────────────────────────────────
 
@@ -34,7 +46,7 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-function exec(cmd, timeoutMs = 30000) {
+function exec(cmd, timeoutMs = 60000) {
   fs.mkdirSync(SCRIPT_DIR, { recursive: true });
   const file = path.join(SCRIPT_DIR, `sh_${Date.now()}.sh`);
   fs.writeFileSync(file, `#!/bin/sh\n${cmd}\n`, { mode: 0o755 });
@@ -47,9 +59,7 @@ function exec(cmd, timeoutMs = 30000) {
   }
 }
 
-function adb(args, timeout = 30000) {
-  return exec(`adb ${args}`, timeout);
-}
+function adb(args, timeout = 60000)  { return exec(`adb ${args}`, timeout); }
 
 function shell(cmd, timeout = 30000) {
   const file = path.join(SCRIPT_DIR, `adb_${Date.now()}.sh`);
@@ -60,15 +70,30 @@ function shell(cmd, timeout = 30000) {
   return out;
 }
 
-function tap(x, y) { shell(`input tap ${x} ${y}`); }
-function swipe(x1, y1, x2, y2, d = 300) { shell(`input swipe ${x1} ${y1} ${x2} ${y2} ${d}`); }
-function keyevent(k) { shell(`input keyevent ${k}`); }
+function tap(x, y)                     { shell(`input tap ${x} ${y}`); }
+function swipe(x1, y1, x2, y2, d=300) { shell(`input swipe ${x1} ${y1} ${x2} ${y2} ${d}`); }
+function keyevent(k)                   { shell(`input keyevent ${k}`); }
 function textInput(str) {
-  const safe = str.replace(/ /g, '%s');
+  const safe = str.replace(/ /g, '%s').replace(/&/g, '\\&');
   shell(`input text "${safe}"`);
 }
 
-// ── UIAutomator XML Parsing ───────────────────────────────────────────────────
+// ── Screenshot helper ─────────────────────────────────────────────────────────
+
+let screenshotIndex = 0;
+async function screenshot(label) {
+  screenshotIndex++;
+  const name   = `vmos_${String(screenshotIndex).padStart(2, '0')}_${label}.png`;
+  const device = `/sdcard/${name}`;
+  const local  = path.join(SCREENSHOT_DIR, name);
+  shell(`screencap -p ${device}`);
+  adb(`pull ${device} ${local}`);
+  shell(`rm -f ${device}`);
+  log('SCREENSHOT', `Saved: ${local}`);
+  return local;
+}
+
+// ── UIAutomator helpers ───────────────────────────────────────────────────────
 
 async function getXML(timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
@@ -85,87 +110,58 @@ function parseBounds(boundsStr) {
   const match = boundsStr.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
   if (!match) return null;
   const [, left, top, right, bottom] = match.map(Number);
-  return {
-    x: Math.round((left + right) / 2),
-    y: Math.round((top + bottom) / 2)
-  };
+  return { x: Math.round((left + right) / 2), y: Math.round((top + bottom) / 2) };
 }
 
 function findElement(xml, searchText) {
-  const lowerSearch = searchText.toLowerCase();
-  const exactRe = new RegExp(`(?:text|content-desc)="([^"]*${searchText}[^"]*)"[^>]*bounds="([^"]+)"`, 'gi');
+  const lower = searchText.toLowerCase();
+  const escaped = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(
+    `(?:text|content-desc)="([^"]*${escaped}[^"]*)"[^>]*bounds="([^"]+)"`, 'gi'
+  );
   let match;
   const matches = [];
-  
-  while ((match = exactRe.exec(xml)) !== null) {
+  while ((match = re.exec(xml)) !== null) {
     const [, text, bounds] = match;
     const coords = parseBounds(bounds);
-    if (coords) matches.push({ text, bounds, coords, exact: text.toLowerCase() === lowerSearch });
+    if (coords) matches.push({ text, coords, exact: text.toLowerCase() === lower });
   }
-  
-  if (matches.length === 0) return null;
+  if (!matches.length) return null;
   return matches.find(m => m.exact) || matches[0];
 }
 
-// ── Post-Action Verification ──────────────────────────────────────────────────
+async function verifyScreen(expectedTexts, timeoutMs = 12000) {
+  const deadline   = Date.now() + timeoutMs;
+  const candidates = Array.isArray(expectedTexts) ? expectedTexts : [expectedTexts];
+  while (Date.now() < deadline) {
+    const xml = await getXML();
+    const low = xml.toLowerCase();
+    for (const t of candidates) {
+      if (low.includes(t.toLowerCase())) return { success: true, found: t, xml };
+    }
+    await sleep(800);
+  }
+  const xml = await getXML();
+  return { success: false, found: null, xml };
+}
+
+async function waitFor(text, timeoutMs = 45000) {
+  log('WAIT', `Waiting for "${text}"…`);
+  const result = await verifyScreen(text, timeoutMs);
+  if (!result.success) throw new Error(`Timeout waiting for "${text}"`);
+  const el = findElement(result.xml, text);
+  if (!el) throw new Error(`Found "${text}" in XML but no bounds`);
+  return { xml: result.xml, element: el };
+}
 
 async function getVisibleText() {
   const xml = await getXML();
   const texts = [];
-  const textRe = /text="([^"]*)"/g;
-  const descRe = /content-desc="([^"]*)"/g;
-  let m;
-  
-  while ((m = textRe.exec(xml)) !== null) {
-    if (m[1]) texts.push(m[1]);
+  for (const re of [/text="([^"]*)"/g, /content-desc="([^"]*)"/g]) {
+    let m;
+    while ((m = re.exec(xml)) !== null) if (m[1]) texts.push(m[1]);
   }
-  while ((m = descRe.exec(xml)) !== null) {
-    if (m[1]) texts.push(m[1]);
-  }
-  
-  // Filter out garbage: base64, long random strings, and image data
-  return [...new Set(texts)].filter(t => {
-    // Must be reasonable length (not too short, not too long)
-    if (t.length < 2 || t.length > 100) return false;
-    // Must not be base64-like (long strings with base64 chars only)
-    if (/^[A-Za-z0-9+/=]{20,}$/.test(t)) return false;
-    // Must contain at least one space or be a recognizable word
-    // Or be a common UI label
-    const commonLabels = ['Login', 'Register', 'Email', 'Password', 'Submit', 'Continue', 'Next', 'Back', 'Home', 'Search', 'VMOS', 'Cloud', 'WhatsApp', 'US', 'EU', 'Asia', 'Never', 'Save', 'Chrome', 'Starting', 'Agree', 'Phone number'];
-    const hasCommonWord = commonLabels.some(label => t.toLowerCase().includes(label.toLowerCase()));
-    const hasSpace = t.includes(' ');
-    const isReasonable = /^[A-Za-z0-9\s\-_./@&]+$/.test(t);
-    return (hasSpace || hasCommonWord) && isReasonable;
-  });
-}
-
-async function verifyScreen(expectedTexts, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
-  const expectedArray = Array.isArray(expectedTexts) ? expectedTexts : [expectedTexts];
-  
-  while (Date.now() < deadline) {
-    const xml = await getXML();
-    const lowerXml = xml.toLowerCase();
-    
-    for (const expected of expectedArray) {
-      if (lowerXml.includes(expected.toLowerCase())) {
-        return { success: true, found: expected, xml };
-      }
-    }
-    await sleep(800);
-  }
-  
-  const finalXml = await getXML();
-  return { success: false, found: null, xml: finalXml };
-}
-
-async function waitFor(text, timeoutMs = 30000) {
-  log('WAIT', `Waiting for "${text}"...`);
-  const result = await verifyScreen(text, timeoutMs);
-  if (!result.success) throw new Error(`Timeout waiting for "${text}"`);
-  const el = findElement(result.xml, text);
-  if (!el) throw new Error(`Found "${text}" but no bounds`);
-  return { xml: result.xml, element: el };
+  return [...new Set(texts)].filter(t => t.length >= 2 && t.length <= 120);
 }
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
@@ -174,20 +170,26 @@ async function webhook(event, extra = {}) {
   if (!WEBHOOK_URL) return;
   return new Promise((resolve) => {
     const body = JSON.stringify({
-      event, phone_number: PHONE, telegram_user_id: parseInt(USER_ID, 10), run_id: RUN_ID, ...extra
+      event,
+      phone_number: PHONE,
+      telegram_user_id: parseInt(USER_ID, 10),
+      run_id: RUN_ID,
+      ...extra,
     });
-    const u = new URL(WEBHOOK_URL);
+    const u    = new URL(WEBHOOK_URL);
     const isHttps = u.protocol === 'https:';
-    const options = {
-      hostname: u.hostname, port: u.port || (isHttps ? 443 : 80),
-      path: u.pathname, method: 'POST',
+    const opts = {
+      hostname: u.hostname,
+      port: u.port || (isHttps ? 443 : 80),
+      path: u.pathname,
+      method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
         'X-Webhook-Secret': WEBHOOK_SECRET,
       },
     };
-    const req = (isHttps ? https : http).request(options, (res) => {
+    const req = (isHttps ? https : http).request(opts, res => {
       log('WEBHOOK', `${event} → ${res.statusCode}`);
       resolve();
     });
@@ -198,375 +200,363 @@ async function webhook(event, extra = {}) {
   });
 }
 
-// ── Main Automation Flow ──────────────────────────────────────────────────────
+// ── HTTP GET (follows redirects) ──────────────────────────────────────────────
+
+function httpGet(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const u   = new URL(url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const opts = {
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers: { 'User-Agent': 'wa-register/1.0', ...headers },
+    };
+    lib.get(opts, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return httpGet(res.headers.location, headers).then(resolve).catch(reject);
+      }
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    }).on('error', reject);
+  });
+}
+
+// ── Download file to disk (follows redirects) ─────────────────────────────────
+
+function downloadFile(url, dest, headers = {}) {
+  return new Promise((resolve, reject) => {
+    log('DOWNLOAD', `${url} → ${dest}`);
+    const u   = new URL(url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const opts = {
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers: { 'User-Agent': 'wa-register/1.0', ...headers },
+    };
+    lib.get(opts, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return downloadFile(res.headers.location, dest, headers).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode} downloading ${url}`));
+      }
+      const out = fs.createWriteStream(dest);
+      res.pipe(out);
+      out.on('finish', () => { out.close(); resolve(dest); });
+      out.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+// ── APK fetch: direct URL or GitHub releases API ──────────────────────────────
+
+async function fetchApk() {
+  if (!GITHUB_REPO) throw new Error('GITHUB_REPOSITORY is not set');
+
+  const authHeaders = GITHUB_TOKEN
+    ? { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' }
+    : { Accept: 'application/vnd.github+json' };
+
+  log('APK', `Fetching latest release from github.com/${GITHUB_REPO}`);
+  const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+  const resp = await httpGet(apiUrl, authHeaders);
+  if (resp.status !== 200) throw new Error(`GitHub API ${resp.status}: ${resp.body}`);
+
+  const release = JSON.parse(resp.body);
+  log('APK', `Latest release: ${release.tag_name} — ${release.assets.length} asset(s)`);
+
+  // Look specifically for whatsapp.apk
+  const asset = release.assets.find(a => a.name === 'whatsapp.apk');
+  if (!asset) throw new Error(`No whatsapp.apk found in release ${release.tag_name}`);
+
+  log('APK', `Downloading whatsapp.apk (${Math.round(asset.size / 1024 / 1024)} MB)`);
+  await downloadFile(asset.browser_download_url, APK_LOCAL, authHeaders);
+}
+
+// ── WhatsApp permissions ──────────────────────────────────────────────────────
+
+const WA_PERMISSIONS = [
+  'android.permission.READ_CONTACTS',
+  'android.permission.WRITE_CONTACTS',
+  'android.permission.READ_PHONE_STATE',
+  'android.permission.CALL_PHONE',
+  'android.permission.RECORD_AUDIO',
+  'android.permission.CAMERA',
+  'android.permission.READ_EXTERNAL_STORAGE',
+  'android.permission.WRITE_EXTERNAL_STORAGE',
+  'android.permission.ACCESS_FINE_LOCATION',
+  'android.permission.ACCESS_COARSE_LOCATION',
+  'android.permission.POST_NOTIFICATIONS',
+  'android.permission.RECEIVE_SMS',
+  'android.permission.READ_SMS',
+  'android.permission.SEND_SMS',
+];
+
+// ── OTP polling ───────────────────────────────────────────────────────────────
+// bot.py should write the OTP to /tmp/wa_otp_<phone>.txt when it arrives.
+
+async function waitForOtp(timeoutMs = 180000) {
+  const otpFile = `/tmp/wa_otp_${PHONE}.txt`;
+  log('OTP', `Polling for OTP (${timeoutMs / 1000}s max)…`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(otpFile)) {
+      const otp = fs.readFileSync(otpFile, 'utf8').trim();
+      fs.unlinkSync(otpFile);
+      log('OTP', `✓ Received OTP: ${otp}`);
+      return otp;
+    }
+    await sleep(3000);
+  }
+  throw new Error('Timeout: no OTP received within 3 minutes');
+}
+
+// ── Main flow ─────────────────────────────────────────────────────────────────
 
 async function main() {
-  log('INIT', `Starting automation for phone: ${PHONE}`);
-  
-  // 1. Check emulator
-  log('STEP 1', 'Checking emulator...');
+  log('INIT', `Starting direct WhatsApp automation for: ${PHONE}`);
+
+  // STEP 1 — Emulator check
+  log('STEP 1', 'Checking emulator…');
   const boot = shell('getprop sys.boot_completed');
   if (boot !== '1') throw new Error(`Emulator not ready: ${boot}`);
   log('STEP 1', '✓ Emulator ready');
 
-  // 2. Wake device
-  log('STEP 2', 'Waking device...');
   keyevent('KEYCODE_WAKEUP');
   await sleep(500);
   swipe(540, 1800, 540, 900, 400);
   await sleep(500);
   shell('settings put global stay_on_while_plugged_in 3');
-  log('STEP 2', '✓ Device awake');
+  // Disable animations for faster UI
+  shell('settings put global window_animation_scale 0');
+  shell('settings put global transition_animation_scale 0');
+  shell('settings put global animator_duration_scale 0');
 
-  // 3. Grant Chrome permissions BEFORE launching (prevents dialogs)
-  log('STEP 3', 'Granting Chrome permissions...');
-  const CHROME_PERMS = [
-    'android.permission.RECORD_AUDIO',
-    'android.permission.CAMERA',
-    'android.permission.READ_EXTERNAL_STORAGE',
-    'android.permission.WRITE_EXTERNAL_STORAGE',
-    'android.permission.ACCESS_FINE_LOCATION',
-    'android.permission.ACCESS_COARSE_LOCATION',
-    'android.permission.POST_NOTIFICATIONS'
-  ];
-  for (const perm of CHROME_PERMS) {
-    shell(`pm grant com.android.chrome ${perm} 2>/dev/null || true`);
+  // STEP 2 — Download APK
+  log('STEP 2', 'Downloading WhatsApp APK from GitHub release…');
+  await fetchApk();
+  const apkSize = fs.statSync(APK_LOCAL).size;
+  log('STEP 2', `✓ APK ready (${Math.round(apkSize / 1024 / 1024)} MB)`);
+
+  // STEP 3 — Install APK
+  log('STEP 3', 'Installing WhatsApp…');
+  shell(`pm uninstall ${WA_PACKAGE} 2>/dev/null || true`);
+  await sleep(1000);
+  const installOut = adb(`install -r -g "${APK_LOCAL}"`, 120000);
+  log('STEP 3', `Install: ${installOut}`);
+  if (!installOut.toLowerCase().includes('success')) {
+    throw new Error(`APK install failed: ${installOut}`);
   }
-  log('STEP 3', '✓ Permissions granted');
+  log('STEP 3', '✓ WhatsApp installed');
 
-  // 4. Launch Chrome
-  log('STEP 4', 'Launching Chrome...');
-  shell('am start -n com.android.chrome/com.google.android.apps.chrome.Main 2>/dev/null');
-  await sleep(4000);
-  
-  // POST-ACTION: Show screen FIRST before handling anything
-  log('POST-ACTION', 'Verifying Chrome launched...');
-  const chromeTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${chromeTexts.slice(0, 10).join(' | ')}`);
-  
-  // Handle welcome screen (precise detection)
-  const welcomeCheck = await verifyScreen([
-    'Welcome to Chrome',
-    'Use without an account',
-    'Add account to device',
-    'Accept & continue',
-    'Terms of Service',
-    'Search or type URL'
-  ], 8000);
-  
-  if (welcomeCheck.found === 'Welcome to Chrome' || 
-      welcomeCheck.found === 'Use without an account' ||
-      welcomeCheck.found === 'Add account to device') {
-    log('STEP 4', 'Welcome screen detected, skipping setup...');
-    
-    // Click "Use without an account"
-    const noAccount = findElement(welcomeCheck.xml, 'Use without an account');
-    if (noAccount) {
-      tap(noAccount.coords.x, noAccount.coords.y);
-    } else {
-      tap(800, 1700); // Coordinate fallback (bottom right)
-    }
-    log('STEP 4', '✓ Clicked "Use without an account"');
-    await sleep(2000);
-    
-    // Look for Accept & continue
-    const acceptCheck = await verifyScreen(['Accept & continue', 'Next', 'Continue'], 5000);
-    if (acceptCheck.success) {
-      const btn = findElement(acceptCheck.xml, acceptCheck.found);
-      if (btn) tap(btn.coords.x, btn.coords.y);
-      else tap(800, 1600); // Fallback
-      log('STEP 4', `✓ Clicked "${acceptCheck.found}"`);
-      await sleep(2000);
-    }
-    
-    // Handle "No thanks" for sync
-    const syncCheck = await verifyScreen(['No thanks', 'Not now'], 3000);
-    if (syncCheck.success) {
-      const skipBtn = findElement(syncCheck.xml, syncCheck.found);
-      if (skipBtn) tap(skipBtn.coords.x, skipBtn.coords.y);
-      else tap(250, 1550); // "No thanks" usually on left
-      log('STEP 4', `✓ Clicked "${syncCheck.found}"`);
-      await sleep(2000);
-    }
-    
-    // Show screen after setup
-    const afterSetupTexts = await getVisibleText();
-    log('POST-ACTION', `After setup - Screen shows: ${afterSetupTexts.slice(0, 10).join(' | ')}`);
+  // STEP 4 — Grant permissions upfront
+  log('STEP 4', 'Granting permissions…');
+  for (const perm of WA_PERMISSIONS) {
+    shell(`pm grant ${WA_PACKAGE} ${perm} 2>/dev/null || true`);
   }
-  
-  // Final Chrome ready check
-  const chromeReady = await verifyScreen([
-    'Search or type URL',
-    'Search or type web address',
-    'New tab',
-    'Address bar',
-    'Discover'
-  ], 5000);
-  log('POST-ACTION', chromeReady.success ? `✓ Chrome ready: "${chromeReady.found}"` : '⚠ Chrome state unclear');
+  log('STEP 4', '✓ Permissions granted');
 
-  // 5. Navigate to URL - Use UIAutomator to find address bar properly
-  log('STEP 5', `Navigating to ${TARGET_URL}...`);
-  
-  // Find and tap address bar by text (avoids microphone icon)
-  try {
-    const addressBar = await waitFor('Search or type web address');
-    tap(addressBar.element.coords.x, addressBar.element.coords.y);
-    log('STEP 5', '✓ Tapped address bar');
-  } catch (e) {
-    // Fallback: try 'Search or type URL' variant
-    try {
-      const addressBar2 = await waitFor('Search or type URL');
-      tap(addressBar2.element.coords.x, addressBar2.element.coords.y);
-      log('STEP 5', '✓ Tapped address bar (URL variant)');
-    } catch (e2) {
-      // Last resort: coordinate tap on left side
-      log('STEP 5', '⚠ Could not find address bar, using coordinate fallback');
-      tap(150, 150);
-    }
-  }
-  
-  await sleep(800);
-  keyevent('KEYCODE_CTRL_A');
-  await sleep(200);
-  keyevent('KEYCODE_DEL');
-  await sleep(200);
-  textInput(TARGET_URL);
-  await sleep(500);
-  keyevent('KEYCODE_ENTER');
-  await sleep(6000);
-  
-  // POST-ACTION: Verify page loaded
-  log('POST-ACTION', 'Verifying page loaded...');
-  const pageTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${pageTexts.slice(0, 10).join(' | ')}`);
-  const navCheck = await verifyScreen([
-    'Please enter your email address',
-    'Login/Register',
-    'Email',
-    'VMOS',
-    'Cloud',
-    'Password',
-    'Login'
-  ], 10000);
-  log('POST-ACTION', navCheck.success ? `✓ Page loaded: "${navCheck.found}"` : '⚠ Page may not have loaded');
-
-  // 6. Enter Email - Find Login/Register button and tap above it where email field is
-  log('STEP 6', 'Entering email...');
-  try {
-    // Try to find by text first
-    const emailField = await waitFor('Please enter your email address');
-    tap(emailField.element.coords.x, emailField.element.coords.y);
-    log('STEP 6', '✓ Found email field by text');
-  } catch (e) {
-    // Fallback: find Login/Register button and tap above it where email field is
-    log('STEP 6', '⚠ Email field text not found, finding relative to Login/Register');
-    try {
-      const loginRegBtn = await waitFor('Login/Register');
-      // Email field is above the Login/Register button (approximately 200px)
-      const tapX = loginRegBtn.element.coords.x;
-      const tapY = loginRegBtn.element.coords.y - 200;
-      tap(tapX, tapY);
-      log('STEP 6', `✓ Tapped at (${tapX}, ${tapY}) above Login/Register`);
-    } catch (e2) {
-      // Last resort: fixed coordinate
-      log('STEP 6', '⚠ Using fixed coordinate fallback');
-      tap(540, 550); // Above center where email field should be
-    }
-  }
-  
-  await sleep(500);
-  keyevent('KEYCODE_CTRL_A');
-  await sleep(200);
-  keyevent('KEYCODE_DEL');
-  await sleep(200);
-  textInput(EMAIL);
-  await sleep(800);
-  
-  // POST-ACTION: Verify after email
-  log('POST-ACTION', 'Verifying after email entry...');
-  const emailTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${emailTexts.slice(0, 10).join(' | ')}`);
-
-  // 7. Click Login/Register
-  log('STEP 7', 'Clicking Login/Register...');
-  const loginReg = await waitFor('Login/Register');
-  tap(loginReg.element.coords.x, loginReg.element.coords.y);
-  await sleep(3000);
-  
-  // POST-ACTION: Verify after Login/Register
-  log('POST-ACTION', 'Verifying after Login/Register click...');
-  const lrTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${lrTexts.slice(0, 10).join(' | ')}`);
-  const lrCheck = await verifyScreen(['Please enter your password', 'Password', 'Login'], 5000);
-  log('POST-ACTION', lrCheck.success ? `✓ Now on: "${lrCheck.found}"` : '⚠ State unclear');
-
-  // 8. Enter Password - Find Login button and tap above it where password field is
-  log('STEP 8', 'Entering password...');
-  try {
-    const passField = await waitFor('Please enter your password');
-    tap(passField.element.coords.x, passField.element.coords.y);
-    log('STEP 8', '✓ Found password field by text');
-  } catch (e) {
-    // Fallback: find Login button and tap above it where password field is
-    log('STEP 8', '⚠ Password field text not found, finding relative to Login');
-    try {
-      const loginBtn = await waitFor('Login');
-      // Password field is above the Login button (approximately 200px)
-      const tapX = loginBtn.element.coords.x;
-      const tapY = loginBtn.element.coords.y - 200;
-      tap(tapX, tapY);
-      log('STEP 8', `✓ Tapped at (${tapX}, ${tapY}) above Login`);
-    } catch (e2) {
-      // Last resort: fixed coordinate
-      log('STEP 8', '⚠ Using fixed coordinate fallback');
-      tap(540, 550);
-    }
-  }
-  
-  await sleep(500);
-  keyevent('KEYCODE_CTRL_A');
-  await sleep(200);
-  keyevent('KEYCODE_DEL');
-  await sleep(200);
-  textInput(PASSWORD);
-  await sleep(800);
-  
-  // POST-ACTION: Verify after password
-  log('POST-ACTION', 'Verifying after password entry...');
-  const passTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${passTexts.slice(0, 10).join(' | ')}`);
-
-  // 9. Click Login
-  log('STEP 9', 'Clicking Login...');
-  const loginBtn = await waitFor('Login');
-  tap(loginBtn.element.coords.x, loginBtn.element.coords.y);
+  // STEP 5 — Launch WhatsApp
+  log('STEP 5', 'Launching WhatsApp…');
+  shell(`monkey -p ${WA_PACKAGE} -c android.intent.category.LAUNCHER 1`);
   await sleep(5000);
-  
-  // POST-ACTION: Verify after Login
-  log('POST-ACTION', 'Verifying after Login click...');
-  const loginTexts = await getVisibleText();
-  log('POST-ACTION', `Screen shows: ${loginTexts.slice(0, 10).join(' | ')}`);
+  await screenshot('launch');
 
-  // 10. Wait 15 seconds for page to fully load and show save password dialog
-  log('STEP 10', 'Waiting 15 seconds for page to stabilize...');
-  await sleep(15000);
-  
-  // Check for save password dialog and click "Never"
-  log('STEP 10', 'Checking for save password dialog...');
-  const savePassCheck = await verifyScreen(['Save password?', 'Never', 'Save'], 5000);
-  if (savePassCheck.success) {
-    log('STEP 10', `✓ Found save password dialog: "${savePassCheck.found}"`);
-    try {
-      const neverBtn = await waitFor('Never');
-      tap(neverBtn.element.coords.x, neverBtn.element.coords.y);
-      log('STEP 10', '✓ Clicked "Never" on save password dialog');
-    } catch (e) {
-      // Fallback: tap left side where "Never" usually is
-      log('STEP 10', '⚠ Could not find "Never" button, using coordinate fallback');
-      tap(300, 1650); // Left side of dialog
+  const launchCheck = await verifyScreen(
+    ['Agree and continue', 'AGREE AND CONTINUE', 'Continue', 'WhatsApp'],
+    20000
+  );
+  log('STEP 5', launchCheck.success
+    ? `✓ WhatsApp up, found: "${launchCheck.found}"`
+    : '⚠ Still loading…'
+  );
+
+  // STEP 6 — Agree & continue
+  log('STEP 6', 'Agreeing to terms…');
+  for (const label of ['AGREE AND CONTINUE', 'Agree and continue', 'Continue']) {
+    const check = await verifyScreen(label, 3000);
+    if (check.success) {
+      const btn = findElement(check.xml, label);
+      if (btn) { tap(btn.coords.x, btn.coords.y); break; }
     }
-    await sleep(2000);
-  } else {
-    log('STEP 10', '⚠ No save password dialog found');
+  }
+  await sleep(2000);
+  await screenshot('after_agree');
+
+  // Dismiss any permission dialogs WhatsApp shows (Allow / Don't allow)
+  for (let i = 0; i < 6; i++) {
+    const dlg = await verifyScreen(['Allow', 'ALLOW'], 2000);
+    if (!dlg.success) break;
+    const btn = findElement(dlg.xml, dlg.found);
+    tap(btn ? btn.coords.x : 700, btn ? btn.coords.y : 1400);
+    await sleep(1000);
   }
 
-  // STEP 11: Close advertisement popup by clicking X button
-  log('STEP 11', 'Closing advertisement popup...');
-  await sleep(3000); // Wait for popup to fully appear
-  
-  // X button at bottom center of popup - y=1620 as specified
-  const xButtonX = 540;
-  const xButtonY = 1620;
-  
-  log('STEP 11', `Clicking X button at (${xButtonX}, ${xButtonY})`);
-  tap(xButtonX, xButtonY);
-  await sleep(2000);
-  log('STEP 11', '✓ Closed advertisement popup');
-  
-  // Show screen after step 11
-  const step11Texts = await getVisibleText();
-  log('STEP 11', `Screen show: ${step11Texts.slice(0, 10).join(' | ')}`);
-
-  // STEP 12: Start Cloud Phone
-  log('STEP 12', 'Starting Cloud Phone...');
-  await sleep(1000);
-  tap(300, 1300);
-  await sleep(40000); // Wait 40 seconds for Cloud Phone to start
-
-  // Verify Cloud Phone started by checking for Chrome or WhatsApp
-  log('POST-ACTION', 'Verifying Cloud Phone started...');
-  const cloudPhoneCheck = await verifyScreen(['System Tools', 'WhatsApp'], 10000);
-  if (cloudPhoneCheck.success) {
-    log('POST-ACTION', `✓ Cloud Phone started, found: "${cloudPhoneCheck.found}"`);
-  } else {
-    log('POST-ACTION', '⚠ Cloud Phone may not have started properly');
+  // STEP 7 — Enter phone number
+  log('STEP 7', 'Entering phone number…');
+  const phoneScreen = await verifyScreen(
+    ['Phone number', 'Enter your phone number', 'phone number'],
+    15000
+  );
+  if (!phoneScreen.success) {
+    await screenshot('phone_screen_missing');
+    throw new Error('Phone number screen not reached');
   }
-  log('STEP 12', '✓ Cloud Phone started');
-  
-  // Show screen after step 12
-  const step12Texts = await getVisibleText();
-  log('STEP 12', `Screen show: ${step12Texts.slice(0, 10).join(' | ')}`);
+  await screenshot('phone_screen');
 
-  // STEP 13: Find and open WhatsApp1
-  log('STEP 13', 'Finding and opening WhatsApp1...');
-  const whatsapp1 = await waitFor('WhatsApp1');
-  tap(whatsapp1.element.coords.x, whatsapp1.element.coords.y);
-  await sleep(2000);
-  log('STEP 13', '✓ Opened WhatsApp1');
-  
-  // Show screen after step 13
-  const step13Texts = await getVisibleText();
-  log('STEP 13', `Screen show: ${step13Texts.slice(0, 10).join(' | ')}`);
+  // Tap the phone number field
+  const phoneField = await waitFor('Phone number');
+  tap(phoneField.element.coords.x, phoneField.element.coords.y);
+  await sleep(500);
+  keyevent('KEYCODE_CTRL_A');
+  await sleep(200);
+  keyevent('KEYCODE_DEL');
+  await sleep(200);
+  // Type digits only (WhatsApp parses country code from the flag picker)
+  const digitsOnly = PHONE.replace(/\D/g, '');
+  textInput(digitsOnly);
+  await sleep(500);
+  await screenshot('phone_entered');
 
-  // STEP 14: Find and click "Agree and continue"
-  log('STEP 14', 'Clicking Agree and continue...');
-  const agreeBtn = await waitFor('Agree and continue');
-  tap(agreeBtn.element.coords.x, agreeBtn.element.coords.y);
-  await sleep(1500);
-  log('STEP 14', '✓ Clicked Agree and continue');
-  
-  // Show screen after clicking Agree and continue
-  const step14Texts = await getVisibleText();
-  log('STEP 14', `Screen show: ${step14Texts.slice(0, 10).join(' | ')}`);
-
-  // STEP 15: Find "Phone number" and click above it to search country code
-  log('STEP 15', 'Finding Phone number field...');
+  // Tap Next / arrow
   try {
-    const phoneField = await waitFor('Phone number');
-    // Click above the Phone number field to access country code search
-    const tapX = phoneField.element.coords.x;
-    const tapY = phoneField.element.coords.y - 150; // 150px above phone field
-    tap(tapX, tapY);
-    log('STEP 15', `✓ Clicked at (${tapX}, ${tapY}) above Phone number for country code`);
-  } catch (e) {
-    log('STEP 15', '⚠ Could not find Phone number field');
-    throw e;
+    const nextBtn = await waitFor('Next');
+    tap(nextBtn.element.coords.x, nextBtn.element.coords.y);
+  } catch {
+    tap(900, 1800); // FAB arrow fallback
   }
-  await sleep(1000);
-  
-  // Show screen after clicking above Phone number
-  const step15Texts = await getVisibleText();
-  log('STEP 15', `Screen show: ${step15Texts.slice(0, 10).join(' | ')}`);
+  await sleep(2000);
 
-  // STOP HERE as requested
-  log('COMPLETE', 'Stopped after clicking country code search');
-  
-  // Take final screenshot
-  shell('screencap -p /sdcard/final.png');
-  adb('pull /sdcard/final.png /tmp/vmos_final.png');
-  log('DEBUG', 'Screenshot saved to /tmp/vmos_final.png');
-  
-  await webhook('vmos_stopped', { step: 'after_country_code_click', screen: 'Stopped at country code selection' });
+  // "Is this your number?" confirmation
+  const confirmDlg = await verifyScreen(['OK', 'Yes', 'Confirm'], 5000);
+  if (confirmDlg.success) {
+    const btn = findElement(confirmDlg.xml, confirmDlg.found);
+    tap(btn ? btn.coords.x : 700, btn ? btn.coords.y : 1000);
+    await sleep(2000);
+  }
+  await screenshot('after_phone_submit');
+
+  // STEP 8 — Wait for OTP screen
+  log('STEP 8', 'Waiting for OTP screen…');
+  const otpScreen = await verifyScreen(
+    ['Enter the 6-digit code', 'Verification code', 'Enter code', 'digit code'],
+    30000
+  );
+  if (!otpScreen.success) {
+    await screenshot('otp_screen_error');
+    throw new Error('OTP screen did not appear');
+  }
+  await screenshot('otp_screen');
+  log('STEP 8', '✓ OTP screen reached');
+  await webhook('otp_requested', { step: 'awaiting_otp' });
+
+  // STEP 9 — Enter OTP
+  log('STEP 9', 'Waiting for OTP from bot…');
+  const otp = await waitForOtp(180000);
+  log('STEP 9', `Entering OTP: ${otp}`);
+
+  try {
+    const codeField = await waitFor('Enter the 6-digit code');
+    tap(codeField.element.coords.x, codeField.element.coords.y + 80);
+  } catch {
+    tap(540, 900);
+  }
+  await sleep(500);
+  keyevent('KEYCODE_CTRL_A');
+  keyevent('KEYCODE_DEL');
+  textInput(otp);
+  await sleep(2000);
+  await screenshot('otp_entered');
+
+  // WhatsApp auto-submits; if not, press Next
+  const autoSubmit = await verifyScreen(
+    ['Chats', 'Start chatting', 'New chat', 'CHATS', 'Your profile'],
+    10000
+  );
+  if (!autoSubmit.success) {
+    try {
+      const nextBtn2 = await waitFor('Next');
+      tap(nextBtn2.element.coords.x, nextBtn2.element.coords.y);
+    } catch {
+      tap(900, 1800);
+    }
+    await sleep(3000);
+  }
+
+  // STEP 10 — Post-registration screens
+  log('STEP 10', 'Handling post-registration screens…');
+
+  // Notification permission
+  const notifDlg = await verifyScreen(['Allow', 'Not now'], 4000);
+  if (notifDlg.success) {
+    const btn = findElement(notifDlg.xml, 'Allow');
+    tap(btn ? btn.coords.x : 700, btn ? btn.coords.y : 1400);
+    await sleep(1000);
+  }
+
+  // Profile name (new number)
+  const profileScreen = await verifyScreen(
+    ['Your name', 'Profile info', 'Enter your name'],
+    5000
+  );
+  if (profileScreen.success) {
+    log('STEP 10', 'Profile screen — entering name');
+    try {
+      const nameField = await waitFor('Your name');
+      tap(nameField.element.coords.x, nameField.element.coords.y + 50);
+    } catch { tap(540, 900); }
+    await sleep(400);
+    textInput('User');
+    await sleep(400);
+    try {
+      const nxt = await waitFor('Next');
+      tap(nxt.element.coords.x, nxt.element.coords.y);
+    } catch { tap(900, 1800); }
+    await sleep(2000);
+  }
+
+  // Backup / restore prompt
+  const backupScreen = await verifyScreen(['Back up', 'Skip', 'Not now', 'Later'], 4000);
+  if (backupScreen.success) {
+    const skipLabel = backupScreen.found === 'Back up' ? 'Skip' : backupScreen.found;
+    const btn = findElement(backupScreen.xml, skipLabel);
+    tap(btn ? btn.coords.x : 540, btn ? btn.coords.y : 1700);
+    await sleep(1000);
+  }
+
+  // STEP 11 — Confirm ready
+  log('STEP 11', 'Verifying WhatsApp is ready…');
+  const ready = await verifyScreen(
+    ['Chats', 'New chat', 'CHATS', 'Start chatting'],
+    20000
+  );
+  await screenshot('whatsapp_ready');
+
+  if (!ready.success) {
+    log('STEP 11', '⚠ Could not confirm Chats screen');
+    await webhook('bad_number', { reason: 'Registration did not complete successfully' });
+    process.exit(1);
+  }
+
+  log('STEP 11', '✓ WhatsApp ready — Chats screen visible');
+
+  // STEP 12 — Notify success
+  await webhook('registered', { step: 'complete', screen: 'WhatsApp Chats' });
+  log('COMPLETE', `✓ Registration complete for ${PHONE}`);
 }
 
 main().catch(async (err) => {
   log('FATAL', err.message);
   try {
-    shell('screencap -p /sdcard/error.png');
-    adb('pull /sdcard/error.png /tmp/vmos_error.png');
+    await screenshot('fatal_error');
     const texts = await getVisibleText();
     log('ERROR_SCREEN', `Last visible: ${texts.slice(0, 10).join(' | ')}`);
-  } catch (e) {}
+  } catch (_) {}
   await webhook('bad_number', { reason: err.message });
   process.exit(1);
 });
