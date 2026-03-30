@@ -41,13 +41,15 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends adb
 
-      - name: Run Automation
+      - name: Run WhatsApp Automation
         env:
           PHONE_NUMBER: ${{ inputs.phone_number }}
           TELEGRAM_USER_ID: ${{ inputs.telegram_user_id }}
           WEBHOOK_URL: ${{ inputs.webhook_url }}/webhook/event
           WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: Ademmanu/WSCREATEANDPAIR
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 30
@@ -59,12 +61,20 @@ jobs:
           emulator-boot-timeout: 900
           script: node .github/scripts/wa_register.js
 
-      - name: Upload Screenshots
+      - name: Upload All Screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots-${{ github.run_id }}
-          path: /tmp/vmos_*.png
+          path: /tmp/wa_screenshot_*.png
+          if-no-files-found: ignore
+
+      - name: Upload Error Screenshot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-screenshot-${{ github.run_id }}
+          path: /tmp/wa_error.png
           if-no-files-found: ignore
 
       - name: Notify bot — failure
@@ -84,7 +94,7 @@ jobs:
               \"phone_number\": \"$PHONE_NUMBER\",
               \"telegram_user_id\": $TELEGRAM_USER_ID,
               \"run_id\": \"$GITHUB_RUN_ID\",
-              \"reason\": \"VMOS Cloud automation failed - emulator error\"
+              \"reason\": \"WhatsApp registration automation failed\"
             }"
 
       - name: Notify bot — cancelled
