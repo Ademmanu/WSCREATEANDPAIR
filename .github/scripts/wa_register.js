@@ -258,6 +258,64 @@ async function main() {
   takeScreenshot('03_permissions_granted');
   log('STEP 3', '✓ Permissions granted');
 
+  // 3a. Check and update Google Play services
+  log('STEP 3a', 'Checking Google Play services...');
+  await sleep(1000);
+  
+  // Get Google Play services version
+  const gmsVersion = shell('dumpsys package com.google.android.gms | grep versionName');
+  log('STEP 3a', `Google Play services version: ${gmsVersion}`);
+  
+  // Open Play Store to check for updates
+  log('STEP 3a', 'Opening Play Store to check for Google Play services updates...');
+  shell('am start -a android.intent.action.VIEW -d "market://details?id=com.google.android.gms"');
+  await sleep(5000);
+  takeScreenshot('03a_play_store_opened');
+  
+  // Check if update button exists
+  const playStoreXml = await getXML();
+  const updateBtn = findElement(playStoreXml, 'Update') || findElement(playStoreXml, 'Install');
+  
+  if (updateBtn) {
+    log('STEP 3a', 'Google Play services update available, clicking Update...');
+    tap(updateBtn.coords.x, updateBtn.coords.y);
+    await sleep(3000);
+    takeScreenshot('03a_update_clicked');
+    
+    // Wait for update to complete (check for "Open" button or timeout after 60s)
+    log('STEP 3a', 'Waiting for Google Play services update to complete...');
+    const updateTimeout = 60000; // 60 seconds
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < updateTimeout) {
+      await sleep(3000);
+      const checkXml = await getXML();
+      const openBtn = findElement(checkXml, 'Open') || findElement(checkXml, 'Play');
+      
+      if (openBtn) {
+        log('STEP 3a', '✓ Google Play services update completed');
+        takeScreenshot('03a_update_completed');
+        break;
+      }
+      
+      // Check if still updating
+      const updatingText = findElement(checkXml, 'Installing') || 
+                          findElement(checkXml, 'Downloading') ||
+                          findElement(checkXml, 'Pending');
+      if (updatingText) {
+        log('STEP 3a', 'Update in progress...');
+      }
+    }
+  } else {
+    log('STEP 3a', '✓ Google Play services is up to date');
+  }
+  
+  // Go back to home screen
+  keyevent('KEYCODE_HOME');
+  await sleep(1000);
+  takeScreenshot('03a_back_to_home');
+  log('STEP 3a', '✓ Google Play services check completed');
+
   // 4. Launch WhatsApp
   log('STEP 4', 'Launching WhatsApp...');
   shell(`am start -n ${WHATSAPP_PACKAGE}/${WHATSAPP_ACTIVITY}`);
@@ -321,7 +379,55 @@ async function main() {
   const afterAgreeTexts = await getVisibleText();
   log('POST-ACTION', `After Agree - Screen shows: ${afterAgreeTexts.slice(0, 10).join(' | ')}`);
   
-  // Verify we're on phone number entry screen or permissions dialog
+  // 5a. Handle Google Play services update dialog (common in emulators)
+  log('STEP 5a', 'Checking for Google Play services dialog...');
+  await sleep(1000);
+  
+  const playServicesCheck = await verifyScreen([
+    'Update Google Play services',
+    'Google Play services',
+    'Update',
+    'Skip',
+    'Not now',
+    'Cancel'
+  ], 3000);
+  
+  if (playServicesCheck.success) {
+    log('STEP 5a', `Found Google Play dialog: "${playServicesCheck.found}"`);
+    const playServicesXml = await getXML();
+    
+    // Try to find Skip/Not now/Cancel buttons first (to avoid updating)
+    const skipBtn = findElement(playServicesXml, 'Skip') || 
+                    findElement(playServicesXml, 'Not now') || 
+                    findElement(playServicesXml, 'Cancel');
+    
+    if (skipBtn) {
+      log('STEP 5a', `Clicking skip button at (${skipBtn.coords.x}, ${skipBtn.coords.y})`);
+      tap(skipBtn.coords.x, skipBtn.coords.y);
+      await sleep(2000);
+      takeScreenshot('05a_play_services_skipped');
+      log('POST-ACTION', '✓ Skipped Google Play services update');
+    } else {
+      // If no skip button, click OK or Update to dismiss
+      const okBtn = findElement(playServicesXml, 'OK') || 
+                    findElement(playServicesXml, 'Update');
+      if (okBtn) {
+        log('STEP 5a', `Clicking dismiss button at (${okBtn.coords.x}, ${okBtn.coords.y})`);
+        tap(okBtn.coords.x, okBtn.coords.y);
+        await sleep(2000);
+        takeScreenshot('05a_play_services_dismissed');
+        log('POST-ACTION', '✓ Dismissed Google Play services dialog');
+      }
+    }
+    
+    // Wait a bit for WhatsApp to continue loading
+    await sleep(2000);
+  } else {
+    log('STEP 5a', 'No Google Play services dialog found, continuing...');
+  }
+  
+  // 5b. Verify we're on phone number entry screen or permissions dialog
+  log('STEP 5b', 'Checking for phone number screen or permission dialogs...');
   const phoneCheck = await verifyScreen([
     'Phone number',
     'Enter your phone number',
