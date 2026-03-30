@@ -43,22 +43,48 @@ jobs:
 
       - name: Download WhatsApp APK from GitHub Release
         run: |
-          # Download WhatsApp APK from your repository's releases
-          # Replace 'YOUR_REPO' with your actual repo and adjust version/tag as needed
-          WHATSAPP_URL="https://github.com/YOUR_OWNER/YOUR_REPO/releases/download/whatsapp-v2.24.20/whatsapp.apk"
+          # Download WhatsApp APK from your repository's GitHub Release
+          # 
+          # Setup instructions:
+          # 1. Upload whatsapp.apk to your repository's Releases
+          # 2. Create a release (e.g., "whatsapp-apk-v2.24.20")
+          # 3. Attach the whatsapp.apk file to that release
+          # 4. Update the URL below with your repository owner and name
+          #
+          # Format: https://github.com/YOUR_OWNER/YOUR_REPO/releases/download/TAG_NAME/whatsapp.apk
+          # Example: https://github.com/johndoe/wa-automation/releases/download/whatsapp-v2.24.20/whatsapp.apk
           
-          # Alternative: Download from official source or use a direct link
-          # WHATSAPP_URL="https://scontent.whatsapp.net/v/t61.24694-34/..."
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          APK_TAG="whatsapp"  # Change this to your release tag
           
-          echo "Downloading WhatsApp APK..."
+          WHATSAPP_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${APK_TAG}/whatsapp.apk"
+          
+          echo "Downloading WhatsApp APK from: $WHATSAPP_URL"
           curl -L -o /tmp/whatsapp.apk "$WHATSAPP_URL" || {
-            echo "Failed to download from release, trying alternative..."
-            # Fallback: Use a direct download link or fail gracefully
+            echo "❌ Failed to download WhatsApp APK from GitHub Release"
+            echo "Please ensure you have:"
+            echo "  1. Created a GitHub Release with tag: ${APK_TAG}"
+            echo "  2. Uploaded whatsapp.apk to that release"
+            echo "  3. Made the release public or ensured the token has access"
             exit 1
           }
           
+          # Verify the download
+          if [ ! -f /tmp/whatsapp.apk ]; then
+            echo "❌ APK file not found after download"
+            exit 1
+          fi
+          
+          FILE_SIZE=$(stat -f%z /tmp/whatsapp.apk 2>/dev/null || stat -c%s /tmp/whatsapp.apk 2>/dev/null)
+          if [ "$FILE_SIZE" -lt 10000000 ]; then
+            echo "⚠️  Warning: APK file size is suspiciously small (${FILE_SIZE} bytes)"
+            echo "This might indicate a failed download or incorrect file"
+          fi
+          
           ls -lh /tmp/whatsapp.apk
           file /tmp/whatsapp.apk
+          echo "✓ WhatsApp APK downloaded successfully"
 
       - name: Run Automation
         env:
