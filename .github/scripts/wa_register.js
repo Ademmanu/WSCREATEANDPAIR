@@ -220,18 +220,8 @@ async function main() {
   takeScreenshot('01_emulator_ready');
   log('STEP 1', '✓ Emulator ready');
 
-  // 2. Wake device
-  log('STEP 2', 'Waking device...');
-  keyevent('KEYCODE_WAKEUP');
-  await sleep(500);
-  swipe(540, 1800, 540, 900, 400);
-  await sleep(500);
-  shell('settings put global stay_on_while_plugged_in 3');
-  takeScreenshot('02_device_awake');
-  log('STEP 2', '✓ Device awake');
-
-  // 3. Grant WhatsApp permissions BEFORE launching
-  log('STEP 3', 'Granting WhatsApp permissions...');
+  // 2. Grant WhatsApp permissions BEFORE launching
+  log('STEP 2', 'Granting WhatsApp permissions...');
   const WHATSAPP_PERMS = [
     'android.permission.INTERNET',
     'android.permission.ACCESS_NETWORK_STATE',
@@ -255,35 +245,32 @@ async function main() {
   for (const perm of WHATSAPP_PERMS) {
     shell(`pm grant ${WHATSAPP_PACKAGE} ${perm} 2>/dev/null || true`);
   }
-  takeScreenshot('03_permissions_granted');
-  log('STEP 3', '✓ Permissions granted');
+  log('STEP 2', '✓ Permissions granted');
 
-  // 3a. Check and update Google Play services
-  log('STEP 3a', 'Checking Google Play services...');
+  // 2a. Check and update Google Play services
+  log('STEP 2a', 'Checking Google Play services...');
   await sleep(1000);
   
   // Get Google Play services version
   const gmsVersion = shell('dumpsys package com.google.android.gms | grep versionName');
-  log('STEP 3a', `Google Play services version: ${gmsVersion}`);
+  log('STEP 2a', `Google Play services version: ${gmsVersion}`);
   
   // Open Play Store to check for updates
-  log('STEP 3a', 'Opening Play Store to check for Google Play services updates...');
+  log('STEP 2a', 'Opening Play Store to check for Google Play services updates...');
   shell('am start -a android.intent.action.VIEW -d "market://details?id=com.google.android.gms"');
   await sleep(5000);
-  takeScreenshot('03a_play_store_opened');
   
   // Check if update button exists
   const playStoreXml = await getXML();
   const updateBtn = findElement(playStoreXml, 'Update') || findElement(playStoreXml, 'Install');
   
   if (updateBtn) {
-    log('STEP 3a', 'Google Play services update available, clicking Update...');
+    log('STEP 2a', 'Google Play services update available, clicking Update...');
     tap(updateBtn.coords.x, updateBtn.coords.y);
     await sleep(3000);
-    takeScreenshot('03a_update_clicked');
     
     // Wait for update to complete (check for "Open" button or timeout after 60s)
-    log('STEP 3a', 'Waiting for Google Play services update to complete...');
+    log('STEP 2a', 'Waiting for Google Play services update to complete...');
     const updateTimeout = 60000; // 60 seconds
     const startTime = Date.now();
     
@@ -293,8 +280,7 @@ async function main() {
       const openBtn = findElement(checkXml, 'Open') || findElement(checkXml, 'Play');
       
       if (openBtn) {
-        log('STEP 3a', '✓ Google Play services update completed');
-        takeScreenshot('03a_update_completed');
+        log('STEP 2a', '✓ Google Play services update completed');
         break;
       }
       
@@ -303,21 +289,20 @@ async function main() {
                           findElement(checkXml, 'Downloading') ||
                           findElement(checkXml, 'Pending');
       if (updatingText) {
-        log('STEP 3a', 'Update in progress...');
+        log('STEP 2a', 'Update in progress...');
       }
     }
   } else {
-    log('STEP 3a', '✓ Google Play services is up to date');
+    log('STEP 2a', '✓ Google Play services is up to date');
   }
   
   // Go back to home screen
   keyevent('KEYCODE_HOME');
   await sleep(1000);
-  takeScreenshot('03a_back_to_home');
-  log('STEP 3a', '✓ Google Play services check completed');
+  log('STEP 2a', '✓ Google Play services check completed');
 
-  // 4. Launch WhatsApp
-  log('STEP 4', 'Launching WhatsApp...');
+  // 3. Launch WhatsApp
+  log('STEP 3', 'Launching WhatsApp...');
   shell(`am start -n ${WHATSAPP_PACKAGE}/${WHATSAPP_ACTIVITY}`);
   await sleep(5000);
   
@@ -325,29 +310,10 @@ async function main() {
   log('POST-ACTION', 'Verifying WhatsApp launched...');
   const whatsappTexts = await getVisibleText();
   log('POST-ACTION', `Screen shows: ${whatsappTexts.slice(0, 10).join(' | ')}`);
-  takeScreenshot('04_whatsapp_launched');
+  takeScreenshot('02_whatsapp_launched');
   
-  // 4a. Check for initial OK/Continue dialogs (permissions, info screens, etc.)
-  log('STEP 4a', 'Checking for initial dialogs (OK, Continue, Allow, etc.)...');
-  await sleep(1000);
-  
-  const initialDialogCheck = await verifyScreen(['OK', 'Continue', 'Allow', 'Got it'], 3000);
-  if (initialDialogCheck.success) {
-    log('STEP 4a', `Found dialog button: "${initialDialogCheck.found}"`);
-    const dialogBtn = findElement(initialDialogCheck.xml, initialDialogCheck.found);
-    if (dialogBtn) {
-      log('STEP 4a', `Clicking "${initialDialogCheck.found}" at (${dialogBtn.coords.x}, ${dialogBtn.coords.y})`);
-      tap(dialogBtn.coords.x, dialogBtn.coords.y);
-      await sleep(2000);
-      takeScreenshot('04a_initial_dialog_clicked');
-      log('POST-ACTION', `✓ Clicked "${initialDialogCheck.found}"`);
-    }
-  } else {
-    log('STEP 4a', 'No initial dialog found, continuing...');
-  }
-  
-  // 4b. Verify WhatsApp is on welcome/terms screen
-  log('STEP 4b', 'Waiting for welcome screen...');
+  // 3a. Verify WhatsApp is on welcome/terms screen
+  log('STEP 3a', 'Waiting for welcome screen...');
   await sleep(1000);
   const welcomeCheck = await verifyScreen([
     'Welcome to WhatsApp',
@@ -366,109 +332,45 @@ async function main() {
     throw new Error('WhatsApp did not reach welcome/terms screen');
   }
   log('POST-ACTION', `✓ WhatsApp ready: "${welcomeCheck.found}"`);
-  takeScreenshot('04b_welcome_screen');
+  takeScreenshot('03_welcome_screen');
 
-  // 5. Click "Agree and continue"
-  log('STEP 5', 'Clicking Agree and continue...');
+  // 4. Click "Agree and continue"
+  log('STEP 4', 'Clicking Agree and continue...');
   const agreeBtn = await waitFor('Agree and continue');
   tap(agreeBtn.element.coords.x, agreeBtn.element.coords.y);
   await sleep(2000);
   
   // POST-ACTION: Screenshot and verify
-  takeScreenshot('05_agree_clicked');
+  takeScreenshot('04_agree_clicked');
   const afterAgreeTexts = await getVisibleText();
   log('POST-ACTION', `After Agree - Screen shows: ${afterAgreeTexts.slice(0, 10).join(' | ')}`);
   
-  // 5a. Handle Google Play services update dialog (common in emulators)
-  log('STEP 5a', 'Checking for Google Play services dialog...');
-  await sleep(1000);
-  
-  const playServicesCheck = await verifyScreen([
-    'Update Google Play services',
-    'Google Play services',
-    'Update',
-    'Skip',
-    'Not now',
-    'Cancel'
-  ], 3000);
-  
-  if (playServicesCheck.success) {
-    log('STEP 5a', `Found Google Play dialog: "${playServicesCheck.found}"`);
-    const playServicesXml = await getXML();
-    
-    // Try to find Skip/Not now/Cancel buttons first (to avoid updating)
-    const skipBtn = findElement(playServicesXml, 'Skip') || 
-                    findElement(playServicesXml, 'Not now') || 
-                    findElement(playServicesXml, 'Cancel');
-    
-    if (skipBtn) {
-      log('STEP 5a', `Clicking skip button at (${skipBtn.coords.x}, ${skipBtn.coords.y})`);
-      tap(skipBtn.coords.x, skipBtn.coords.y);
-      await sleep(2000);
-      takeScreenshot('05a_play_services_skipped');
-      log('POST-ACTION', '✓ Skipped Google Play services update');
-    } else {
-      // If no skip button, click OK or Update to dismiss
-      const okBtn = findElement(playServicesXml, 'OK') || 
-                    findElement(playServicesXml, 'Update');
-      if (okBtn) {
-        log('STEP 5a', `Clicking dismiss button at (${okBtn.coords.x}, ${okBtn.coords.y})`);
-        tap(okBtn.coords.x, okBtn.coords.y);
-        await sleep(2000);
-        takeScreenshot('05a_play_services_dismissed');
-        log('POST-ACTION', '✓ Dismissed Google Play services dialog');
-      }
-    }
-    
-    // Wait a bit for WhatsApp to continue loading
-    await sleep(2000);
-  } else {
-    log('STEP 5a', 'No Google Play services dialog found, continuing...');
-  }
-  
-  // 5b. Verify we're on phone number entry screen or permissions dialog
-  log('STEP 5b', 'Checking for phone number screen or permission dialogs...');
-  const phoneCheck = await verifyScreen([
-    'Phone number',
-    'Enter your phone number',
-    'Continue',
-    'Allow WhatsApp to send and view SMS messages',
-    'Allow',
-    'Deny'
-  ], 8000);
-  
-  if (!phoneCheck.success) {
-    log('POST-ACTION', '⚠ Phone number screen not detected, checking current state...');
-  } else {
-    log('POST-ACTION', `✓ Now on: "${phoneCheck.found}"`);
-  }
-
-  // 6. Handle potential permission dialogs
-  log('STEP 6', 'Checking for permission dialogs...');
+  // 5. Handle potential permission dialogs
+  log('STEP 5', 'Checking for permission dialogs...');
   await sleep(1000);
   
   // Check for SMS permission dialog
   const smsPermCheck = await verifyScreen(['Allow WhatsApp to send and view SMS messages', 'Allow'], 3000);
   if (smsPermCheck.success) {
-    log('STEP 6', 'Found SMS permission dialog, clicking Allow...');
+    log('STEP 5', 'Found SMS permission dialog, clicking Allow...');
     const allowBtn = findElement(smsPermCheck.xml, 'Allow');
     if (allowBtn) {
       tap(allowBtn.coords.x, allowBtn.coords.y);
       await sleep(1500);
-      takeScreenshot('06_sms_permission_allowed');
+      takeScreenshot('05_sms_permission_allowed');
       log('POST-ACTION', '✓ SMS permission granted');
     }
   } else {
-    log('STEP 6', 'No SMS permission dialog found, continuing...');
+    log('STEP 5', 'No SMS permission dialog found, continuing...');
   }
   
-  // 7. Dump UI to detect phone number screen
-  log('STEP 7', 'Dumping UI to detect phone number screen...');
+  // 6. Dump UI to detect phone number screen
+  log('STEP 6', 'Dumping UI to detect phone number screen...');
   await sleep(1000);
   const phoneScreenXml = await getXML();
   const phoneScreenTexts = await getVisibleText();
   log('POST-ACTION', `Phone screen shows: ${phoneScreenTexts.slice(0, 10).join(' | ')}`);
-  takeScreenshot('07_phone_number_screen');
+  takeScreenshot('06_phone_number_screen');
   
   // Verify we're on phone number entry screen
   const phoneNumberCheck = await verifyScreen([
@@ -483,8 +385,8 @@ async function main() {
   }
   log('POST-ACTION', `✓ On phone number screen: "${phoneNumberCheck.found}"`);
   
-  // 8. Parse phone number (country code + national number)
-  log('STEP 8', 'Parsing phone number...');
+  // 7. Parse phone number (country code + national number)
+  log('STEP 7', 'Parsing phone number...');
   let countryCode = '';
   let nationalNumber = '';
   
@@ -526,10 +428,10 @@ async function main() {
     nationalNumber = phoneClean;
   }
   
-  log('STEP 8', `Parsed: Country Code = ${countryCode}, National Number = ${nationalNumber}`);
+  log('STEP 7', `Parsed: Country Code = ${countryCode}, National Number = ${nationalNumber}`);
   
-  // 9. Edit country code
-  log('STEP 9', 'Editing country code...');
+  // 8. Edit country code
+  log('STEP 8', 'Editing country code...');
   await sleep(500);
   
   // Find country code selector (usually shows something like "United States +1" or just the flag/code)
@@ -538,10 +440,10 @@ async function main() {
                           findElement(phoneScreenXml, 'Select');
   
   if (countrySelector) {
-    log('STEP 9', `Found country selector, tapping...`);
+    log('STEP 8', `Found country selector, tapping...`);
     tap(countrySelector.coords.x, countrySelector.coords.y);
     await sleep(2000);
-    takeScreenshot('08_country_selector_opened');
+    takeScreenshot('07_country_selector_opened');
     
     // Try to find the search box or type country code directly
     const searchCheck = await verifyScreen(['Search', 'Type to search'], 3000);
@@ -552,23 +454,23 @@ async function main() {
         await sleep(500);
         textInput(countryCode);
         await sleep(1000);
-        takeScreenshot('09_country_code_typed');
+        takeScreenshot('08_country_code_typed');
         
         // Select first result
         keyevent('KEYCODE_DPAD_DOWN');
         await sleep(300);
         keyevent('KEYCODE_ENTER');
         await sleep(1000);
-        takeScreenshot('10_country_selected');
+        takeScreenshot('09_country_selected');
         log('POST-ACTION', `✓ Country code ${countryCode} selected`);
       }
     }
   } else {
-    log('STEP 9', 'Country code field not found or already set correctly');
+    log('STEP 8', 'Country code field not found or already set correctly');
   }
   
-  // 10. Enter national number
-  log('STEP 10', 'Entering national phone number...');
+  // 9. Enter national number
+  log('STEP 9', 'Entering national phone number...');
   await sleep(1000);
   
   // Dump UI again to find phone number input field
@@ -590,21 +492,21 @@ async function main() {
     // Usually the phone number field is the main/largest EditText on screen
     // Tap on the first or largest one
     const phoneField = inputFields[0];
-    log('STEP 10', `Found phone input field at (${phoneField.x}, ${phoneField.y})`);
+    log('STEP 9', `Found phone input field at (${phoneField.x}, ${phoneField.y})`);
     tap(phoneField.x, phoneField.y);
     await sleep(1000);
     
     // Enter the national number
     textInput(nationalNumber);
     await sleep(1500);
-    takeScreenshot('11_phone_number_entered');
+    takeScreenshot('10_phone_number_entered');
     log('POST-ACTION', `✓ Phone number entered: ${nationalNumber}`);
   } else {
     throw new Error('Could not find phone number input field');
   }
   
-  // 11. Tap NEXT button
-  log('STEP 11', 'Tapping NEXT button...');
+  // 10. Tap NEXT button
+  log('STEP 10', 'Tapping NEXT button...');
   await sleep(500);
   
   const nextBtnXml = await getXML();
@@ -614,10 +516,10 @@ async function main() {
     throw new Error('Could not find NEXT/Continue button');
   }
   
-  log('STEP 11', `Found NEXT button at (${nextBtn.coords.x}, ${nextBtn.coords.y})`);
+  log('STEP 10', `Found NEXT button at (${nextBtn.coords.x}, ${nextBtn.coords.y})`);
   tap(nextBtn.coords.x, nextBtn.coords.y);
   await sleep(2000);
-  takeScreenshot('12_next_clicked');
+  takeScreenshot('11_next_clicked');
   
   // POST-ACTION: Verify what screen we're on after clicking NEXT
   const afterNextTexts = await getVisibleText();
@@ -637,7 +539,7 @@ async function main() {
   
   if (verifyCheck.success) {
     log('POST-ACTION', `✓ Now on verification screen: "${verifyCheck.found}"`);
-    takeScreenshot('13_verification_screen');
+    takeScreenshot('12_verification_screen');
   }
   
   // STOP HERE as requested - after NEXT is clicked
