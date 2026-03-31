@@ -389,250 +389,73 @@ async function main() {
   let countryCode = '';
   let nationalNumber = '';
   
-  // Parse phone number - expecting format like +1234567890 or 1234567890
   const phoneClean = PHONE.replace(/[^0-9+]/g, '');
   const withoutPlus = phoneClean.startsWith('+') ? phoneClean.substring(1) : phoneClean;
   
-  // Common country codes with their typical lengths (country code length + national number length)
-  // Format: [country_code, total_length_with_country_code]
-  const countryCodeMap = [
-    ['1', 11],      // US/Canada: +1 + 10 digits
-    ['7', 11],      // Russia/Kazakhstan: +7 + 10 digits
-    ['20', 12],     // Egypt: +20 + 10 digits
-    ['27', 11],     // South Africa: +27 + 9 digits
-    ['30', 12],     // Greece: +30 + 10 digits
-    ['31', 11],     // Netherlands: +31 + 9 digits
-    ['32', 11],     // Belgium: +32 + 9 digits
-    ['33', 11],     // France: +33 + 9 digits
-    ['34', 11],     // Spain: +34 + 9 digits
-    ['36', 11],     // Hungary: +36 + 9 digits
-    ['39', 12],     // Italy: +39 + 10 digits
-    ['40', 11],     // Romania: +40 + 9 digits
-    ['41', 11],     // Switzerland: +41 + 9 digits
-    ['43', 12],     // Austria: +43 + 10 digits
-    ['44', 12],     // UK: +44 + 10 digits
-    ['45', 10],     // Denmark: +45 + 8 digits
-    ['46', 11],     // Sweden: +46 + 9 digits
-    ['47', 10],     // Norway: +47 + 8 digits
-    ['48', 11],     // Poland: +48 + 9 digits
-    ['49', 12],     // Germany: +49 + 10 digits
-    ['51', 11],     // Peru: +51 + 9 digits
-    ['52', 12],     // Mexico: +52 + 10 digits
-    ['53', 10],     // Cuba: +53 + 8 digits
-    ['54', 12],     // Argentina: +54 + 10 digits
-    ['55', 13],     // Brazil: +55 + 11 digits
-    ['56', 11],     // Chile: +56 + 9 digits
-    ['57', 12],     // Colombia: +57 + 10 digits
-    ['58', 12],     // Venezuela: +58 + 10 digits
-    ['60', 11],     // Malaysia: +60 + 9 digits
-    ['61', 11],     // Australia: +61 + 9 digits
-    ['62', 12],     // Indonesia: +62 + 10 digits
-    ['63', 12],     // Philippines: +63 + 10 digits
-    ['64', 11],     // New Zealand: +64 + 9 digits
-    ['65', 10],     // Singapore: +65 + 8 digits
-    ['66', 11],     // Thailand: +66 + 9 digits
-    ['81', 12],     // Japan: +81 + 10 digits
-    ['82', 12],     // South Korea: +82 + 10 digits
-    ['84', 11],     // Vietnam: +84 + 9 digits
-    ['86', 13],     // China: +86 + 11 digits
-    ['90', 12],     // Turkey: +90 + 10 digits
-    ['91', 12],     // India: +91 + 10 digits
-    ['92', 12],     // Pakistan: +92 + 10 digits
-    ['93', 11],     // Afghanistan: +93 + 9 digits
-    ['94', 11],     // Sri Lanka: +94 + 9 digits
-    ['95', 11],     // Myanmar: +95 + 9 digits
-    ['98', 12],     // Iran: +98 + 10 digits
-    ['212', 12],    // Morocco: +212 + 9 digits
-    ['213', 12],    // Algeria: +213 + 9 digits
-    ['216', 10],    // Tunisia: +216 + 8 digits
-    ['218', 12],    // Libya: +218 + 10 digits
-    ['220', 9],     // Gambia: +220 + 7 digits
-    ['221', 11],    // Senegal: +221 + 9 digits
-    ['222', 10],    // Mauritania: +222 + 8 digits
-    ['223', 10],    // Mali: +223 + 8 digits
-    ['224', 11],    // Guinea: +224 + 9 digits
-    ['225', 12],    // Ivory Coast: +225 + 10 digits
-    ['226', 10],    // Burkina Faso: +226 + 8 digits
-    ['227', 10],    // Niger: +227 + 8 digits
-    ['228', 10],    // Togo: +228 + 8 digits
-    ['229', 10],    // Benin: +229 + 8 digits
-    ['230', 10],    // Mauritius: +230 + 8 digits
-    ['231', 11],    // Liberia: +231 + 9 digits
-    ['232', 10],    // Sierra Leone: +232 + 8 digits
-    ['233', 12],    // Ghana: +233 + 10 digits
-    ['234', 13],    // Nigeria: +234 + 10 digits
-    ['235', 10],    // Chad: +235 + 8 digits
-    ['236', 10],    // Central African Republic: +236 + 8 digits
-    ['237', 11],    // Cameroon: +237 + 9 digits
-    ['238', 9],     // Cape Verde: +238 + 7 digits
-    ['239', 9],     // Sao Tome: +239 + 7 digits
-    ['240', 11],    // Equatorial Guinea: +240 + 9 digits
-    ['241', 9],     // Gabon: +241 + 7 digits
-    ['242', 11],    // Republic of Congo: +242 + 9 digits
-    ['243', 11],    // DR Congo: +243 + 9 digits
-    ['244', 11],    // Angola: +244 + 9 digits
-    ['245', 9],     // Guinea-Bissau: +245 + 7 digits
-    ['246', 9],     // British Indian Ocean Territory: +246 + 7 digits
-    ['248', 9],     // Seychelles: +248 + 7 digits
-    ['249', 11],    // Sudan: +249 + 9 digits
-    ['250', 11],    // Rwanda: +250 + 9 digits
-    ['251', 11],    // Ethiopia: +251 + 9 digits
-    ['252', 10],    // Somalia: +252 + 8 digits
-    ['253', 10],    // Djibouti: +253 + 8 digits
-    ['254', 12],    // Kenya: +254 + 10 digits
-    ['255', 12],    // Tanzania: +255 + 10 digits
-    ['256', 12],    // Uganda: +256 + 10 digits
-    ['257', 10],    // Burundi: +257 + 8 digits
-    ['258', 12],    // Mozambique: +258 + 10 digits
-    ['260', 12],    // Zambia: +260 + 10 digits
-    ['261', 12],    // Madagascar: +261 + 10 digits
-    ['262', 12],    // Reunion/Mayotte: +262 + 10 digits
-    ['263', 12],    // Zimbabwe: +263 + 10 digits
-    ['264', 12],    // Namibia: +264 + 10 digits
-    ['265', 11],    // Malawi: +265 + 9 digits
-    ['266', 10],    // Lesotho: +266 + 8 digits
-    ['267', 10],    // Botswana: +267 + 8 digits
-    ['268', 10],    // Eswatini: +268 + 8 digits
-    ['269', 9],     // Comoros: +269 + 7 digits
-    ['350', 10],    // Gibraltar: +350 + 8 digits
-    ['351', 11],    // Portugal: +351 + 9 digits
-    ['352', 11],    // Luxembourg: +352 + 9 digits
-    ['353', 11],    // Ireland: +353 + 9 digits
-    ['354', 9],     // Iceland: +354 + 7 digits
-    ['355', 11],    // Albania: +355 + 9 digits
-    ['356', 10],    // Malta: +356 + 8 digits
-    ['357', 10],    // Cyprus: +357 + 8 digits
-    ['358', 11],    // Finland: +358 + 9 digits
-    ['359', 11],    // Bulgaria: +359 + 9 digits
-    ['370', 10],    // Lithuania: +370 + 8 digits
-    ['371', 10],    // Latvia: +371 + 8 digits
-    ['372', 9],     // Estonia: +372 + 7 digits
-    ['373', 10],    // Moldova: +373 + 8 digits
-    ['374', 10],    // Armenia: +374 + 8 digits
-    ['375', 11],    // Belarus: +375 + 9 digits
-    ['376', 8],     // Andorra: +376 + 6 digits
-    ['377', 10],    // Monaco: +377 + 8 digits
-    ['378', 12],    // San Marino: +378 + 10 digits
-    ['380', 12],    // Ukraine: +380 + 10 digits
-    ['381', 11],    // Serbia: +381 + 9 digits
-    ['382', 10],    // Montenegro: +382 + 8 digits
-    ['383', 10],    // Kosovo: +383 + 8 digits
-    ['385', 11],    // Croatia: +385 + 9 digits
-    ['386', 10],    // Slovenia: +386 + 8 digits
-    ['387', 10],    // Bosnia: +387 + 8 digits
-    ['389', 10],    // North Macedonia: +389 + 8 digits
-    ['420', 11],    // Czech Republic: +420 + 9 digits
-    ['421', 11],    // Slovakia: +421 + 9 digits
-    ['423', 9],     // Liechtenstein: +423 + 7 digits
-    ['500', 7],     // Falkland Islands: +500 + 5 digits
-    ['501', 9],     // Belize: +501 + 7 digits
-    ['502', 10],    // Guatemala: +502 + 8 digits
-    ['503', 10],    // El Salvador: +503 + 8 digits
-    ['504', 10],    // Honduras: +504 + 8 digits
-    ['505', 10],    // Nicaragua: +505 + 8 digits
-    ['506', 10],    // Costa Rica: +506 + 8 digits
-    ['507', 10],    // Panama: +507 + 8 digits
-    ['509', 10],    // Haiti: +509 + 8 digits
-    ['590', 11],    // Guadeloupe: +590 + 9 digits
-    ['591', 10],    // Bolivia: +591 + 8 digits
-    ['592', 9],     // Guyana: +592 + 7 digits
-    ['593', 11],    // Ecuador: +593 + 9 digits
-    ['594', 11],    // French Guiana: +594 + 9 digits
-    ['595', 11],    // Paraguay: +595 + 9 digits
-    ['596', 11],    // Martinique: +596 + 9 digits
-    ['597', 9],     // Suriname: +597 + 7 digits
-    ['598', 10],    // Uruguay: +598 + 8 digits
-    ['599', 9],     // Caribbean Netherlands: +599 + 7 digits
-    ['670', 10],    // East Timor: +670 + 8 digits
-    ['672', 8],     // Antarctica: +672 + 6 digits
-    ['673', 9],     // Brunei: +673 + 7 digits
-    ['674', 9],     // Nauru: +674 + 7 digits
-    ['675', 10],    // Papua New Guinea: +675 + 8 digits
-    ['676', 7],     // Tonga: +676 + 5 digits
-    ['677', 9],     // Solomon Islands: +677 + 7 digits
-    ['678', 9],     // Vanuatu: +678 + 7 digits
-    ['679', 9],     // Fiji: +679 + 7 digits
-    ['680', 9],     // Palau: +680 + 7 digits
-    ['681', 8],     // Wallis and Futuna: +681 + 6 digits
-    ['682', 7],     // Cook Islands: +682 + 5 digits
-    ['683', 6],     // Niue: +683 + 4 digits
-    ['685', 9],     // Samoa: +685 + 7 digits
-    ['686', 10],    // Kiribati: +686 + 8 digits
-    ['687', 8],     // New Caledonia: +687 + 6 digits
-    ['688', 8],     // Tuvalu: +688 + 6 digits
-    ['689', 10],    // French Polynesia: +689 + 8 digits
-    ['690', 6],     // Tokelau: +690 + 4 digits
-    ['691', 9],     // Micronesia: +691 + 7 digits
-    ['692', 9],     // Marshall Islands: +692 + 7 digits
-    ['850', 13],    // North Korea: +850 + 11 digits
-    ['852', 10],    // Hong Kong: +852 + 8 digits
-    ['853', 10],    // Macau: +853 + 8 digits
-    ['855', 11],    // Cambodia: +855 + 9 digits
-    ['856', 11],    // Laos: +856 + 9 digits
-    ['880', 12],    // Bangladesh: +880 + 10 digits
-    ['886', 11],    // Taiwan: +886 + 9 digits
-    ['960', 9],     // Maldives: +960 + 7 digits
-    ['961', 10],    // Lebanon: +961 + 8 digits
-    ['962', 11],    // Jordan: +962 + 9 digits
-    ['963', 11],    // Syria: +963 + 9 digits
-    ['964', 12],    // Iraq: +964 + 10 digits
-    ['965', 10],    // Kuwait: +965 + 8 digits
-    ['966', 12],    // Saudi Arabia: +966 + 10 digits
-    ['967', 11],    // Yemen: +967 + 9 digits
-    ['968', 10],    // Oman: +968 + 8 digits
-    ['970', 11],    // Palestine: +970 + 9 digits
-    ['971', 11],    // UAE: +971 + 9 digits
-    ['972', 11],    // Israel: +972 + 9 digits
-    ['973', 10],    // Bahrain: +973 + 8 digits
-    ['974', 10],    // Qatar: +974 + 8 digits
-    ['975', 10],    // Bhutan: +975 + 8 digits
-    ['976', 10],    // Mongolia: +976 + 8 digits
-    ['977', 12],    // Nepal: +977 + 10 digits
-    ['992', 11],    // Tajikistan: +992 + 9 digits
-    ['993', 10],    // Turkmenistan: +993 + 8 digits
-    ['994', 11],    // Azerbaijan: +994 + 9 digits
-    ['995', 11],    // Georgia: +995 + 9 digits
-    ['996', 11],    // Kyrgyzstan: +996 + 9 digits
-    ['998', 11]     // Uzbekistan: +998 + 9 digits
-  ];
+  const countryCodeLengths = {
+    '1': 11, '7': 11, '20': 12, '27': 11, '30': 12, '31': 11, '32': 11, '33': 11, '34': 11,
+    '36': 11, '39': 12, '40': 11, '41': 11, '43': 12, '44': 12, '45': 10, '46': 11, '47': 10,
+    '48': 11, '49': 12, '51': 11, '52': 12, '53': 10, '54': 12, '55': 13, '56': 11, '57': 12,
+    '58': 12, '60': 11, '61': 11, '62': 12, '63': 12, '64': 11, '65': 10, '66': 11, '81': 12,
+    '82': 12, '84': 11, '86': 13, '90': 12, '91': 12, '92': 12, '93': 11, '94': 11, '95': 11,
+    '98': 12, '212': 12, '213': 12, '216': 10, '218': 12, '220': 9, '221': 11, '222': 10,
+    '223': 10, '224': 11, '225': 12, '226': 10, '227': 10, '228': 10, '229': 10, '230': 10,
+    '231': 11, '232': 10, '233': 12, '234': 13, '235': 10, '236': 10, '237': 11, '238': 9,
+    '239': 9, '240': 11, '241': 9, '242': 11, '243': 11, '244': 11, '245': 9, '246': 9,
+    '248': 9, '249': 11, '250': 11, '251': 11, '252': 10, '253': 10, '254': 12, '255': 12,
+    '256': 12, '257': 10, '258': 12, '260': 12, '261': 12, '262': 12, '263': 12, '264': 12,
+    '265': 11, '266': 10, '267': 10, '268': 10, '269': 9, '350': 10, '351': 11, '352': 11,
+    '353': 11, '354': 9, '355': 11, '356': 10, '357': 10, '358': 11, '359': 11, '370': 10,
+    '371': 10, '372': 9, '373': 10, '374': 10, '375': 11, '376': 8, '377': 10, '378': 12,
+    '380': 12, '381': 11, '382': 10, '383': 10, '385': 11, '386': 10, '387': 10, '389': 10,
+    '420': 11, '421': 11, '423': 9, '500': 7, '501': 9, '502': 10, '503': 10, '504': 10,
+    '505': 10, '506': 10, '507': 10, '509': 10, '590': 11, '591': 10, '592': 9, '593': 11,
+    '594': 11, '595': 11, '596': 11, '597': 9, '598': 10, '599': 9, '670': 10, '672': 8,
+    '673': 9, '674': 9, '675': 10, '676': 7, '677': 9, '678': 9, '679': 9, '680': 9,
+    '681': 8, '682': 7, '683': 6, '685': 9, '686': 10, '687': 8, '688': 8, '689': 10,
+    '690': 6, '691': 9, '692': 9, '850': 13, '852': 10, '853': 10, '855': 11, '856': 11,
+    '880': 12, '886': 11, '960': 9, '961': 10, '962': 11, '963': 11, '964': 12, '965': 10,
+    '966': 12, '967': 11, '968': 10, '970': 11, '971': 11, '972': 11, '973': 10, '974': 10,
+    '975': 10, '976': 10, '977': 12, '992': 11, '993': 10, '994': 11, '995': 11, '996': 11,
+    '998': 11
+  };
   
-  // Try to match country code by checking if the number matches expected length
   let matched = false;
-  for (const [code, expectedLength] of countryCodeMap) {
-    if (withoutPlus.startsWith(code) && withoutPlus.length === expectedLength) {
-      countryCode = code;
-      nationalNumber = withoutPlus.substring(code.length);
-      matched = true;
-      break;
+  
+  for (let codeLen = 3; codeLen >= 1; codeLen--) {
+    if (withoutPlus.length > codeLen) {
+      const testCode = withoutPlus.substring(0, codeLen);
+      const expectedLength = countryCodeLengths[testCode];
+      
+      if (expectedLength && withoutPlus.length === expectedLength) {
+        countryCode = testCode;
+        nationalNumber = withoutPlus.substring(codeLen);
+        matched = true;
+        break;
+      }
     }
   }
   
-  // Fallback: if no match found, try 3-digit, 2-digit, then 1-digit codes
   if (!matched) {
-    if (withoutPlus.length >= 4) {
-      // Try 3-digit country code
-      const threeDigit = withoutPlus.substring(0, 3);
-      const twoDigit = withoutPlus.substring(0, 2);
-      const oneDigit = withoutPlus.substring(0, 1);
-      
-      // Check if it's a known 3-digit code
-      const threeDigitCodes = countryCodeMap.filter(([code]) => code.length === 3).map(([code]) => code);
-      if (threeDigitCodes.includes(threeDigit)) {
-        countryCode = threeDigit;
-        nationalNumber = withoutPlus.substring(3);
+    for (let codeLen = 3; codeLen >= 1; codeLen--) {
+      if (withoutPlus.length > codeLen) {
+        const testCode = withoutPlus.substring(0, codeLen);
+        if (countryCodeLengths[testCode]) {
+          countryCode = testCode;
+          nationalNumber = withoutPlus.substring(codeLen);
+          matched = true;
+          break;
+        }
       }
-      // Check if it's a known 2-digit code
-      else if (countryCodeMap.some(([code]) => code === twoDigit)) {
-        countryCode = twoDigit;
-        nationalNumber = withoutPlus.substring(2);
-      }
-      // Default to 1-digit (most common)
-      else {
-        countryCode = oneDigit;
-        nationalNumber = withoutPlus.substring(1);
-      }
+    }
+  }
+  
+  if (!matched) {
+    if (withoutPlus.length >= 10) {
+      countryCode = withoutPlus.substring(0, 1);
+      nationalNumber = withoutPlus.substring(1);
     } else {
-      throw new Error(`Phone number too short: ${PHONE}`);
+      throw new Error(`Could not parse phone number: ${PHONE}`);
     }
   }
   
@@ -692,27 +515,11 @@ async function main() {
   log('STEP 10', 'Tapping NEXT button...');
   await sleep(500);
   
-  // Get current screen state before clicking
-  const beforeNextTexts = await getVisibleText();
-  const beforeNextTextString = beforeNextTexts.join(' ');
-  
-  // Try first Next button coordinate
+  // Click Next button
   log('STEP 10', 'Clicking NEXT at (540, 2232)');
   tap(540, 2232);
   await sleep(2000);
   takeScreenshot('10_next_clicked');
-  
-  // Check if screen changed
-  const afterFirstClickTexts = await getVisibleText();
-  const afterFirstClickString = afterFirstClickTexts.join(' ');
-  
-  if (beforeNextTextString === afterFirstClickString) {
-    // Screen didn't change, try second coordinate
-    log('STEP 10', 'No screen change detected, trying NEXT at (540, 2230)');
-    tap(540, 2230);
-    await sleep(2000);
-    takeScreenshot('11_next_clicked_retry');
-  }
   
   // POST-ACTION: Verify what screen we're on after clicking NEXT
   const afterNextTexts = await getVisibleText();
